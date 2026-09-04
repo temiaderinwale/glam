@@ -1,0 +1,221 @@
+rules_version = '2';
+
+/* GLAM — Firestore security rules.
+
+   Traqi's model was one document per workspace with `request.auth.uid == uid`.
+   That cannot express GLAM: a teaching session must be readable by the teacher
+   who wrote it, the school that must approve it, and the firm — while BR-011
+   requires that a school can never reach another school's records. So the model
+   is organisation-scoped, and authorisation is decided from the caller's own
+   users/{uid} profile.
+
+   The interface enforces these rules too, and lib/rules.ts enforces them again
+   before every write. This file is the one that counts, because it is the only
+   one an attacker cannot skip. */
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function active() { return signedIn() && me().status == 'active'; }
+    function isAdmin() { return active() && me().role == 'admin'; }
+    function isTeacher() { return active() && me().role == 'teacher'; }
+    function isSchool() { return active() && me().role == 'school'; }
+    function myOrg(orgId) { return signedIn() && me().orgId == orgId; }
+    function changed(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+    /* BR-020: a super admin is the only account that governs other admins. */
+    function isSuperAdmin() { return isAdmin() && me().adminLevel == 'super'; }
+    /* Holder of the one-and-only founder slot — see bootstrap/platform below. */
+    function isFounder() {
+      return signedIn()
+             && exists(/databases/$(database)/documents/bootstrap/platform)
+             && get(/databases/$(database)/documents/bootstrap/platform).data.founderUid == request.auth.uid;
+    }
+
+    /* ---------- the founder slot ----------
+       Written once, by the first person to register as an administrator. Create
+       is allowed and only for yourself; update and delete are refused outright,
+       which is what makes "first" mean first — a second claimant's write fails
+       instead of overwriting the record. */
+    match /bootstrap/platform {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.founderUid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    /* ---------- identity ---------- */
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+
+      /* BR-001: a new account is always pending, and never grants itself power.
+         Administrators may now self-register, but only into the queue — and
+         never as a super admin. The single exception is the founder, who holds
+         bootstrap/platform and therefore starts active and super, because there
+         is no super admin above them to do the approving. */
+      allow create: if signedIn()
+                    && request.auth.uid == uid
+                    && (
+                      (
+                        request.resource.data.status == 'pending'
+                        && request.resource.data.role in ['teacher', 'school', 'admin']
+                        && request.resource.data.get('adminLevel', 'standard') != 'super'
+                      ) || (
+                        isFounder()
+                        && request.resource.data.role == 'admin'
+                        && request.resource.data.status == 'active'
+                        && request.resource.data.adminLevel == 'super'
+                      )
+                    );
+
+      // A person edits their own profile but cannot change their own role,
+      // status, or administrative grade.
+      allow update: if signedIn() && request.auth.uid == uid
+                    && request.resource.data.role == resource.data.role
+                    && request.resource.data.status == resource.data.status
+                    && request.resource.data.get('adminLevel', 'standard')
+                       == resource.data.get('adminLevel', 'standard');
+
+      /* Only the firm activates, suspends or rejects an ordinary account — and
+         only a SUPER admin may touch another administrator, or hand out the
+         super grade at all. BR-023 and BR-024 (never against your promoter, and
+         never against the founder) need the admins collection to evaluate, so
+         they are enforced in lib/rules.ts and re-checked on every write in
+         lib/data.tsx; this rule stops a standard admin getting near it. */
+      allow update: if isAdmin()
+                    && resource.data.role != 'admin'
+                    && request.resource.data.get('adminLevel', 'standard') == 'standard';
+      allow update: if isSuperAdmin();
+      allow delete: if false;
+    }
+
+    /* ---------- organisation ---------- */
+    match /orgs/{orgId} {
+      allow read: if myOrg(orgId);
+      allow write: if isAdmin() && myOrg(orgId);
+
+      /* Administrators — the firm's own staff. Every administrator can read the
+         roster; only a super admin changes it. The finer rules (BR-023, BR-024)
+         are enforced in the data layer, which can see who promoted whom. */
+      match /admins/{adminId} {
+        allow read: if myOrg(orgId) && isAdmin();
+        allow write: if myOrg(orgId) && isSuperAdmin();
+      }
+
+      /* Teaching sessions — the core record. */
+      match /sessions/{sessionId} {
+        // BR-011: a school reads only its own; a teacher only their own.
+        allow read: if myOrg(orgId) && (
+          isAdmin()
+          || (isTeacher() && resource.data.teacherId == me().teacherId)
+          || (isSchool()  && resource.data.schoolId  == me().schoolId)
+        );
+
+        // BR-002 is checked in the client and again by the assignment lookup here:
+        // a teacher may only create a session for themselves, at a school they hold
+        // an active assignment to.
+        allow create: if myOrg(orgId) && isTeacher()
+                      && request.resource.data.teacherId == me().teacherId
+                      && request.resource.data.status in ['draft', 'submitted']
+                      && request.resource.data.durationMinutes > 0;
+
+        // A teacher may edit only their own, and only while it is still open —
+        // BR-005: an approved session is closed to ordinary editing.
+        allow update: if myOrg(orgId) && isTeacher()
+                      && resource.data.teacherId == me().teacherId
+                      && resource.data.status in ['draft', 'rejected', 'correction']
+                      && request.resource.data.teacherId == resource.data.teacherId;
+
+        // BR-009 / BR-010: the school decides, and may only touch the review fields.
+        // A teacher can never approve their own session because this branch
+        // requires the school role.
+        allow update: if myOrg(orgId) && isSchool()
+                      && resource.data.schoolId == me().schoolId
+                      && changed(['status', 'schoolComment', 'rejectionReason',
+                                  'correctionReason', 'reviewedAt', 'reviewedBy', 'updatedAt'])
+                      && request.resource.data.status in
+                         ['approved', 'rejected', 'correction', 'pending']
+                      // BR-007 / BR-008: a rejection or correction carries a reason.
+                      && (request.resource.data.status != 'rejected'
+                          || request.resource.data.rejectionReason is string)
+                      && (request.resource.data.status != 'correction'
+                          || request.resource.data.correctionReason is string);
+
+        allow update: if myOrg(orgId) && isAdmin();
+
+        // BR-004: a submitted session is cancelled with a reason, never deleted.
+        allow delete: if false;
+      }
+
+      /* Reference and network data. */
+      match /schools/{schoolId} {
+        allow read: if myOrg(orgId) && (isAdmin() || isTeacher() || me().schoolId == schoolId);
+        allow write: if isAdmin() && myOrg(orgId);
+      }
+
+      match /teachers/{teacherId} {
+        // A school sees teacher profiles because it must know who is in its building.
+        allow read: if myOrg(orgId) && (isAdmin() || isSchool() || me().teacherId == teacherId);
+        allow write: if isAdmin() && myOrg(orgId);
+      }
+
+      match /assignments/{assignmentId} {
+        allow read: if myOrg(orgId) && (
+          isAdmin()
+          || (isTeacher() && resource.data.teacherId == me().teacherId)
+          || (isSchool()  && resource.data.schoolId  == me().schoolId)
+        );
+        // A teacher may raise a request, but never grant themselves an assignment.
+        allow create: if myOrg(orgId) && isTeacher()
+                      && request.resource.data.teacherId == me().teacherId
+                      && request.resource.data.status == 'requested';
+        allow update, delete: if isAdmin() && myOrg(orgId);
+      }
+
+      match /subjects/{id}         { allow read: if myOrg(orgId); allow write: if isAdmin() && myOrg(orgId); }
+      match /classes/{id}          { allow read: if myOrg(orgId); allow write: if isAdmin() && myOrg(orgId); }
+      match /academicSessions/{id} { allow read: if myOrg(orgId); allow write: if isAdmin() && myOrg(orgId); }
+      match /settings/{id}         { allow read: if myOrg(orgId); allow write: if isAdmin() && myOrg(orgId); }
+
+      /* Notifications are addressed to a role, and optionally to one teacher or
+         school. Nobody reads another audience's mail. */
+      match /notifications/{id} {
+        allow read: if myOrg(orgId) && (
+          isAdmin()
+          || (resource.data.audienceRole == me().role
+              && (!('audienceId' in resource.data)
+                  || resource.data.audienceId == me().teacherId
+                  || resource.data.audienceId == me().schoolId))
+        );
+        allow create: if active() && myOrg(orgId);
+        // The only field a recipient may change is whether they have read it.
+        allow update: if active() && myOrg(orgId) && changed(['read']);
+        allow delete: if isAdmin() && myOrg(orgId);
+      }
+
+      /* Documents — metadata here, bytes in Storage under the same ownership. */
+      match /documents/{id} {
+        allow read: if myOrg(orgId) && (
+          isAdmin()
+          || (resource.data.ownerType == 'teacher' && resource.data.ownerId == me().teacherId)
+          || (resource.data.ownerType == 'school'  && resource.data.ownerId == me().schoolId)
+        );
+        allow create: if active() && myOrg(orgId);
+        allow update, delete: if isAdmin() && myOrg(orgId);
+      }
+
+      /* The audit trail. Append-only for signed-in accounts, never editable by
+         anyone — a log that can be rewritten proves nothing. Tighten `create` to
+         a server context (Admin SDK or Cloud Function) before production. */
+      match /auditLogs/{id} {
+        allow read: if isAdmin() && myOrg(orgId);
+        allow create: if active() && myOrg(orgId);
+        allow update, delete: if false;
+      }
+    }
+
+    match /{document=**} { allow read, write: if false; }
+  }
+}

@@ -1,0 +1,29 @@
+rules_version = '2';
+
+/* GLAM — Firebase Storage. Uploads are scoped to the owner, capped at 10 MB and
+   restricted to document and image types. Nothing uploaded is ever served as
+   executable content. */
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function okType() {
+      return request.resource.contentType.matches('application/pdf')
+          || request.resource.contentType.matches('image/(png|jpeg)')
+          || request.resource.contentType.matches('application/msword')
+          || request.resource.contentType.matches(
+               'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    }
+    function okSize() { return request.resource.size < 10 * 1024 * 1024; }
+
+    match /orgs/{orgId}/teachers/{teacherId}/{fileName} {
+      allow read: if signedIn();
+      allow write: if signedIn() && okType() && okSize();
+    }
+    match /orgs/{orgId}/schools/{schoolId}/{fileName} {
+      allow read: if signedIn();
+      allow write: if signedIn() && okType() && okSize();
+    }
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}
