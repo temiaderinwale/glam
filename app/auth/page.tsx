@@ -222,9 +222,13 @@ function OrRule() {
   );
 }
 
+/* Shown in the form's error slot when the build carries no Firebase keys, so a
+   visitor reads it. It says what it means for them and nothing about how the
+   thing is built — the setup instructions go to the console in lib/firebase.ts,
+   where the person who can act on them will actually look. */
 function unconfigured() {
   return !firebaseReady
-    ? 'Firebase is not configured yet. Copy .env.example to .env.local, add the keys, and restart the dev server.'
+    ? 'Sign-in is temporarily unavailable. Please try again shortly, or contact Glampter Consults if it continues.'
     : '';
 }
 

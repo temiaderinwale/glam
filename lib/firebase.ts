@@ -33,8 +33,12 @@ export const firebaseReady =
 if (!firebaseReady && typeof window !== 'undefined') {
   // eslint-disable-next-line no-console
   console.error(
-    '[Teach Clock] Firebase is not configured. Copy .env.example to .env.local and fill in ' +
-    'NEXT_PUBLIC_FIREBASE_*. Sign-in is disabled until then; the rest of the app runs on demo data.'
+    '[Teach Clock] Firebase is not configured: NEXT_PUBLIC_FIREBASE_* is missing from this build.\n' +
+    '  Local  — copy .env.example to .env.local, fill it in, restart the dev server.\n' +
+    '  Deploy — set the variables in the host, then trigger a NEW BUILD. Next.js inlines\n' +
+    '           NEXT_PUBLIC_* at build time, so restarting a running deployment cannot pick\n' +
+    '           them up; the values have to be present while `next build` runs.\n' +
+    '  Sign-in is disabled until then; the rest of the app runs on demo data.'
   );
 }
 

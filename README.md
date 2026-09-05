@@ -144,6 +144,37 @@ A Firebase web API key is a public project identifier, not a secret — it ident
 project in browser requests. What actually protects the data is the authorised-domain list
 and the rules file, so deploy those before any real data goes in.
 
+### Deploying
+
+`.env.local` is git-ignored and never leaves your machine, so a deployment has no keys
+unless you give it some. Set the same seven variables in the host's environment settings:
+
+```
+NEXT_PUBLIC_FIREBASE_API_KEY              NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN          NEXT_PUBLIC_FIREBASE_APP_ID
+NEXT_PUBLIC_FIREBASE_PROJECT_ID           NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET
+```
+
+Then **trigger a new build**. This is the part that catches people: Next.js inlines
+`NEXT_PUBLIC_*` into the JavaScript bundle at build time, so restarting a running
+deployment does nothing — the values must be present while `next build` executes. On
+Vercel, redeploy *without* the existing build cache; on Netlify, "Clear cache and deploy".
+
+Four of them decide it — `API_KEY`, `AUTH_DOMAIN`, `PROJECT_ID`, `APP_ID` are what
+`firebaseReady` checks — but set all seven; the storage bucket is needed for uploads.
+
+Two things to check in the console alongside it, or sign-in still fails on the live domain:
+
+- **Authentication → Settings → Authorized domains** must list the deploy domain, or Google
+  sign-in returns `auth/unauthorized-domain`.
+- **Firestore → Rules** must have `firestore.rules` deployed, or an administrator cannot
+  register and Admin Manager cannot write.
+
+When the keys are missing the app does not break — `firebaseReady` is false, sign-in is
+disabled behind a plain "temporarily unavailable" notice, and everything else runs on demo
+data. The actionable detail is logged to the browser console, not shown to visitors.
+
 ### Data model
 
 ```
