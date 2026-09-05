@@ -73,7 +73,7 @@ export function SessionForm({ draft, setDraft, issues, compact = false }: {
       <Select id="f-school" label="School" value={draft.schoolId}
         onChange={(v) => set({ schoolId: v, subject: '', className: '' })}
         options={schools} placeholder="Choose a school" error={err('schoolId')}
-        hint={schools.length ? undefined : 'You have no active assignments yet. Request a school first.'} />
+        hint={schools.length ? undefined : 'You have no active assignments yet. Request to teach in a school first.'} />
 
       <div className={compact ? 'stack' : 'grid-2'}>
         <Select id="f-subject" label="Subject" value={draft.subject} onChange={(v) => set({ subject: v })}

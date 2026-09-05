@@ -20,7 +20,7 @@ import { Field } from '@/components/ui';
 import { LIFECYCLE } from '@/lib/compute';
 import {
   auth, firebaseReady, readProfile, register, resendVerification, resetPassword,
-  signIn, signInWithGoogle, writeProfile
+  endSession, signIn, signInWithGoogle, writeProfile
 } from '@/lib/firebase';
 import { authError, passwordScore, strengthLabel } from '@/lib/format';
 import { useGlam } from '@/lib/store';
@@ -59,10 +59,24 @@ function AuthPage() {
   /* Follow the session wherever it actually is, so a refresh mid-flow lands on
      the right panel rather than back at sign-in. */
   useEffect(() => {
+    /* A pending account is let straight in and told it is under review at the
+       top of the dashboard — a holding page reads as a rejection, and there is
+       nothing here they can break: the shell refuses every write until an
+       administrator activates them. */
     if (stage === 'verify') setPanel('verify');
     else if (stage === 'completeProfile') setPanel('completeProfile');
-    else if (stage === 'pending') setPanel('pending');
-    else if (stage === 'ready') { setEntering(true); router.replace(next); }
+    else if (stage === 'pending' || stage === 'blocked' || stage === 'ready') {
+      setEntering(true); router.replace(next);
+    } else if (stage === 'signedOut') {
+      /* Leaving an interlude has to move the panel as well as end the session.
+         These three are only reachable with an account behind them, so once it
+         is gone they have nothing left to show — without this, signing out of
+         the Google complete-profile step left that step on screen with no
+         session behind it. Panels reached before signing in are untouched, so
+         ?tab= still decides where /auth opens. */
+      setPanel((p) =>
+        p === 'verify' || p === 'completeProfile' || p === 'pending' ? 'register' : p);
+    }
   }, [stage, next, router]);
 
   if (stage === 'loading' || entering) return <Preloader done={entering} />;
@@ -117,15 +131,16 @@ function AuthPage() {
       <main className="px-5 py-10 sm:px-10 lg:px-16 lg:py-14 flex flex-col justify-center">
         <div className="w-full max-w-[440px] mx-auto">
           {panel === 'signin' && (
-            <SignIn onPanel={setPanel}
-              onAdmin={() => { setAdminMode(true); setPanel('register'); }} />
+            <SignIn onPanel={setPanel} />
           )}
           {panel === 'register' && (
             <Register onPanel={setPanel} admin={adminMode} onAdmin={setAdminMode} />
           )}
           {panel === 'reset' && <Reset onPanel={setPanel} />}
           {panel === 'verify' && <Verify onDone={refresh} say={say} />}
-          {panel === 'completeProfile' && <CompleteProfile onDone={refresh} />}
+          {panel === 'completeProfile' && (
+            <CompleteProfile onDone={refresh} onLeave={() => setPanel('register')} />
+          )}
           {panel === 'pending' && <Pending />}
         </div>
       </main>
@@ -212,6 +227,26 @@ function StrengthMeter({ pw }: { pw: string }) {
   );
 }
 
+/* The sign-up form knows which kind of account was being created; the panel
+   that finishes a Google sign-up is a different component reached after the
+   popup returns. Parking the choice is what lets it arrive pre-selected. */
+const SIGNUP_ROLE_KEY = 'glam_signup_role';
+
+const rememberSignupRole = (r: Role) => {
+  try { sessionStorage.setItem(SIGNUP_ROLE_KEY, r); } catch { /* private mode */ }
+};
+
+const forgetSignupRole = () => {
+  try { sessionStorage.removeItem(SIGNUP_ROLE_KEY); } catch { /* private mode */ }
+};
+
+const recallSignupRole = (): Role => {
+  try {
+    const r = sessionStorage.getItem(SIGNUP_ROLE_KEY);
+    return r === 'school' || r === 'admin' ? r : 'teacher';
+  } catch { return 'teacher'; }
+};
+
 /* Sits between the Google fast path and the credential fields. */
 function OrRule() {
   return (
@@ -223,17 +258,19 @@ function OrRule() {
   );
 }
 
+/* Shown in the form's error slot when the build carries no Firebase keys, so a
+   visitor reads it. It says what it means for them and nothing about how the
+   thing is built — the setup instructions go to the console in lib/firebase.ts,
+   where the person who can act on them will actually look. */
 function unconfigured() {
   return !firebaseReady
-    ? 'Firebase is not configured yet. Copy .env.example to .env.local, add the keys, and restart the dev server.'
+    ? 'Sign-in is temporarily unavailable. Please try again shortly, or contact Glampter Consults if it continues.'
     : '';
 }
 
 /* ---------- signin ---------- */
 
-function SignIn({ onPanel, onAdmin }: {
-  onPanel: (p: Panel) => void; onAdmin: () => void;
-}) {
+function SignIn({ onPanel }: { onPanel: (p: Panel) => void }) {
   const [email, setEmail] = useState('');
   const [pw, setPw] = useState('');
   const [busy, setBusy] = useState(false);
@@ -287,15 +324,9 @@ function SignIn({ onPanel, onAdmin }: {
       </form>
 
       <p className="mt-7 text-sm text-[var(--text-2)]">
-        New to <BrandWord />?{' '}
+        Just getting started?{' '}
         <button className="font-semibold" style={{ color: 'var(--accent)' }} onClick={() => onPanel('register')}>
           Create an account
-        </button>
-      </p>
-      <p className="mt-3 text-sm text-[var(--text-2)]">
-        Administrator?{' '}
-        <button className="font-semibold" style={{ color: 'var(--accent)' }} onClick={onAdmin}>
-          Sign up as an admin
         </button>
       </p>
     </>
@@ -401,6 +432,7 @@ function Register({ onPanel, admin, onAdmin }: {
 
   const google = async () => {
     setErr(''); setBusy(true);
+    rememberSignupRole(activeRole);   // so the next panel opens on the right one
     try { await signInWithGoogle(); }
     catch (ex) { setErr(ex instanceof FirebaseError ? authError(ex.code) : unconfigured() || 'Google sign-up failed.'); }
     finally { setBusy(false); }
@@ -410,10 +442,7 @@ function Register({ onPanel, admin, onAdmin }: {
     <>
       <Head
         eyebrow={admin ? 'Administrator sign-up' : 'Create an account'}
-        title={<>Join <BrandWord /></>}
-        sub={admin
-          ? 'Administrator accounts are reviewed by a super admin before they can act.'
-          : 'Tell us who you are — the rest of the form follows from it.'} />
+        title={<>Join <BrandWord /></>} />
 
       <form onSubmit={submit} className="flex flex-col gap-4" noValidate>
         <FormError msg={err} />
@@ -425,8 +454,7 @@ function Register({ onPanel, admin, onAdmin }: {
             <div className="min-w-0">
               <p className="font-display font-bold text-[15px]">Registering as an administrator</p>
               <p className="text-xs text-[var(--text-2)] mt-1">
-                The first administrator on the platform becomes the super admin. Everyone
-                after that waits for a super admin to approve them.
+                Administrator privileges are granted after super admin approval.
               </p>
               <button type="button" className="text-sm font-semibold mt-2"
                 style={{ color: 'var(--accent)' }}
@@ -437,9 +465,7 @@ function Register({ onPanel, admin, onAdmin }: {
           </div>
         ) : (
           <fieldset>
-            <legend className="field-label">
-              I am registering as<span className="req" aria-hidden="true">*</span>
-            </legend>
+            <legend className="field-label">I am registering as</legend>
             <div className="grid grid-cols-2 gap-2.5">
               {([
                 { v: 'teacher' as Role, icon: GraduationCap, t: 'A teacher', d: 'I teach in schools' },
@@ -559,14 +585,27 @@ function Register({ onPanel, admin, onAdmin }: {
           Sign in
         </button>
       </p>
+      {/* Administrators come in by a different door, so it is set apart rather
+          than queued in with the ordinary links: its own rule, its own card and
+          its own button. Shown for both the teacher and the school paths. */}
       {!admin ? (
-        <p className="mt-3 text-sm text-[var(--text-2)]">
-          Administrator?{' '}
-          <button className="font-semibold" style={{ color: 'var(--accent)' }}
-            onClick={() => { onAdmin(true); setBad({}); }}>
-            Sign up as an admin
-          </button>
-        </p>
+        <div className="mt-8 pt-7 border-t" style={{ borderColor: 'var(--border)' }}>
+          <div className="frame frame-flat p-4">
+            <div className="flex items-center gap-2.5">
+              <ShieldPlus size={17} strokeWidth={1.9} style={{ color: 'var(--accent-ink)' }}
+                className="flex-none" aria-hidden="true" />
+              <p className="font-display font-bold text-[14px]">Administrator?</p>
+            </div>
+            <p className="text-xs text-[var(--text-2)] mt-1.5 max-w-[46ch]">
+              Administrators register on a separate path, and are granted privileges after
+              super admin approval.
+            </p>
+            <button type="button" className="btn btn-ghost btn-sm mt-3"
+              onClick={() => { onAdmin(true); setBad({}); }}>
+              Sign up as an admin
+            </button>
+          </div>
+        </div>
       ) : null}
     </>
   );
@@ -669,22 +708,71 @@ function Verify({ onDone, say }: { onDone: () => Promise<void>; say: (m: string)
 
 /* ---------- complete profile ---------- */
 
-function CompleteProfile({ onDone }: { onDone: () => Promise<void> }) {
+function CompleteProfile({ onDone, onLeave }: {
+  onDone: () => Promise<void>; onLeave: () => void;
+}) {
   const { user } = useGlam();
-  const [role, setRole] = useState<Role>('teacher');
-  const [name, setName] = useState(user?.displayName ?? '');
+  const guess = (user?.displayName ?? '').trim().split(/\s+/);
+  const [role, setRole] = useState<Role>(recallSignupRole);
+  const [firstName, setFirstName] = useState(guess[0] ?? '');
+  const [surname, setSurname] = useState(guess.slice(1).join(' '));
+  const [schoolName, setSchoolName] = useState('');
+  const [adminFirst, setAdminFirst] = useState(guess[0] ?? '');
+  const [adminSurname, setAdminSurname] = useState(guess.slice(1).join(' '));
   const [phone, setPhone] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [bad, setBad] = useState<Record<string, string>>({});
+  const [leaving, setLeaving] = useState(false);
+
+  const edit = (key: string, set: (v: string) => void) => (v: string) => {
+    set(v);
+    setBad((p) => { if (!p[key]) return p; const n = { ...p }; delete n[key]; return n; });
+  };
+
+  /* The same fields registration demands, checked the same way. */
+  const check = () => {
+    const need: [string, string, string][] = role === 'school'
+      ? [
+          ['schoolName', schoolName, 'Enter the school name.'],
+          ['adminFirst', adminFirst, 'Enter the school admin first name.'],
+          ['adminSurname', adminSurname, 'Enter the school admin surname.'],
+          ['phone', phone, 'Enter a phone number.']
+        ]
+      : [
+          ['firstName', firstName, 'Enter your first name.'],
+          ['surname', surname, 'Enter your surname.'],
+          ['phone', phone, 'Enter a phone number.']
+        ];
+    const out: Record<string, string> = {};
+    for (const [k, v, msg] of need) if (!v.trim()) out[k] = msg;
+    return out;
+  };
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user) return;
+
+    const found = check();
+    setBad(found);
+    if (Object.keys(found).length) {
+      setErr('Every field is required. Check the ones marked below.');
+      document.getElementById(Object.keys(found)[0])?.focus();
+      return;
+    }
+
     setBusy(true); setErr('');
     try {
       const existing = await readProfile(user.uid);
       await writeProfile(user.uid, {
-        role, displayName: name, phone,
+        role,
+        phone,
+        displayName: role === 'school'
+          ? schoolName.trim()
+          : `${firstName.trim()} ${surname.trim()}`,
+        ...(role === 'school'
+          ? { contactFirstName: adminFirst.trim(), contactSurname: adminSurname.trim() }
+          : { firstName: firstName.trim(), surname: surname.trim() }),
         email: user.email ?? '',
         photoURL: user.photoURL ?? '',
         status: existing?.status ?? 'pending',
@@ -699,15 +787,16 @@ function CompleteProfile({ onDone }: { onDone: () => Promise<void> }) {
   return (
     <>
       <Head eyebrow="Almost there" title="Complete your profile"
-        sub="We need two more things before your account goes to Glampter for review." />
+        sub="A few details Google does not give us, before your account goes for review." />
       <form onSubmit={submit} className="flex flex-col gap-4" noValidate>
         <FormError msg={err} />
         <fieldset>
-          <legend className="field-label">I am</legend>
-          <div className="grid grid-cols-2 gap-2.5">
+          <legend className="field-label">I am registering as</legend>
+          <div className="grid grid-cols-3 gap-2.5">
             {([
               { v: 'teacher' as Role, icon: GraduationCap, t: 'A teacher' },
-              { v: 'school' as Role, icon: Building2, t: 'A school' }
+              { v: 'school' as Role, icon: Building2, t: 'A school' },
+              { v: 'admin' as Role, icon: ShieldPlus, t: 'An administrator' }
             ]).map((o) => (
               <label key={o.v} className="frame p-3.5 cursor-pointer flex flex-col gap-1.5"
                 style={{ borderColor: role === o.v ? 'var(--accent)' : 'var(--border)' }}>
@@ -720,18 +809,79 @@ function CompleteProfile({ onDone }: { onDone: () => Promise<void> }) {
             ))}
           </div>
         </fieldset>
-        <Field label={role === 'school' ? 'School name' : 'Full name'} htmlFor="cname">
-          <input id="cname" className="input" required value={name} onChange={(e) => setName(e.target.value)} />
+        {role === 'school' ? (
+          <>
+            <Field label="School name" htmlFor="schoolName" required error={bad.schoolName}>
+              <input id="schoolName" className="input" required autoComplete="organization"
+                value={schoolName} onChange={(e) => edit('schoolName', setSchoolName)(e.target.value)}
+                aria-invalid={!!bad.schoolName || undefined}
+                placeholder="BMS Montessori School" />
+            </Field>
+            <div className="field-row">
+              <Field label="School admin first name" htmlFor="adminFirst" required error={bad.adminFirst}>
+                <input id="adminFirst" className="input" required autoComplete="given-name"
+                  value={adminFirst} onChange={(e) => edit('adminFirst', setAdminFirst)(e.target.value)}
+                  aria-invalid={!!bad.adminFirst || undefined} placeholder="Folake" />
+              </Field>
+              <Field label="School admin surname" htmlFor="adminSurname" required error={bad.adminSurname}>
+                <input id="adminSurname" className="input" required autoComplete="family-name"
+                  value={adminSurname} onChange={(e) => edit('adminSurname', setAdminSurname)(e.target.value)}
+                  aria-invalid={!!bad.adminSurname || undefined} placeholder="Adeyemi" />
+              </Field>
+            </div>
+          </>
+        ) : (
+          <div className="field-row">
+            <Field label="First name" htmlFor="firstName" required error={bad.firstName}>
+              <input id="firstName" className="input" required autoComplete="given-name"
+                value={firstName} onChange={(e) => edit('firstName', setFirstName)(e.target.value)}
+                aria-invalid={!!bad.firstName || undefined} placeholder="John" />
+            </Field>
+            <Field label="Surname" htmlFor="surname" required error={bad.surname}>
+              <input id="surname" className="input" required autoComplete="family-name"
+                value={surname} onChange={(e) => edit('surname', setSurname)(e.target.value)}
+                aria-invalid={!!bad.surname || undefined} placeholder="Adeyinka" />
+            </Field>
+          </div>
+        )}
+
+        {/* Read-only: the address is what Google signed them in with. */}
+        <Field label="Email" htmlFor="cemail" hint="Taken from your Google account and cannot be changed.">
+          <input id="cemail" className="input" value={user?.email ?? ''} readOnly disabled />
         </Field>
-        <Field label="Phone number" htmlFor="cphone">
-          <input id="cphone" className="input" type="tel" required value={phone}
-            onChange={(e) => setPhone(e.target.value)} placeholder="0803 412 7788" />
+
+        <Field label="Phone number" htmlFor="phone" required error={bad.phone}>
+          <input id="phone" className="input" type="tel" required autoComplete="tel"
+            value={phone} onChange={(e) => edit('phone', setPhone)(e.target.value)}
+            aria-invalid={!!bad.phone || undefined} placeholder="0803 412 7788" />
         </Field>
         <button className="btn btn-primary btn-block" disabled={busy}>
           {busy ? <Loader2 size={16} className="animate-spin" /> : null}
           Save and continue
         </button>
       </form>
+
+      {/* Picking a Google account should not be a one-way door: someone who
+          changes their mind here has no other way back out.
+
+          It abandons the half-finished sign-up outright — ends the Firebase
+          session, drops the remembered role, and moves the panel itself.
+          Waiting on onAuthStateChanged alone is what left this stuck: the
+          session ended but the panel had nothing telling it to change. */}
+      <p className="mt-7 text-sm text-[var(--text-2)]">
+        Changed your mind?{' '}
+        <button
+          className="font-semibold" style={{ color: 'var(--accent)' }} disabled={leaving}
+          onClick={async () => {
+            setLeaving(true);
+            forgetSignupRole();
+            try { await endSession(); } catch { /* session already gone; leave anyway */ }
+            onLeave();
+          }}
+        >
+          {leaving ? 'Leaving…' : 'Back to sign up'}
+        </button>
+      </p>
     </>
   );
 }
@@ -763,7 +913,6 @@ function Pending() {
       </div>
 
       <div className="mt-6 flex flex-col gap-3">
-        <Link href="/dashboard" className="btn btn-primary btn-block">Look around the dashboard</Link>
         <button className="btn btn-ghost btn-block" onClick={() => void logout()}>Sign out</button>
       </div>
     </>

@@ -113,6 +113,36 @@ export const canAdminAct = (
   actor: AdminAccount | null, target: AdminAccount, action: AdminAction
 ) => adminActionIssue(actor, target, action) === null;
 
+/* ---------- BR-027 / BR-028: two keys, not one ----------
+
+   A teacher joining a school, and a period they then teach, are each two
+   decisions: the school confirms what happened in its building, and the firm
+   accepts it as billable service. Neither side can complete the record alone,
+   and the same shape is used for both so there is one thing to learn. */
+
+export type TwoKey = {
+  schoolApprovedAt?: string;
+  adminApprovedAt?: string;
+};
+
+/** Which side this account signs. */
+export const approvalSide = (role: Role): 'school' | 'admin' | null =>
+  role === 'school' ? 'school' : role === 'admin' ? 'admin' : null;
+
+export const schoolSigned = (r: TwoKey) => Boolean(r.schoolApprovedAt);
+export const adminSigned = (r: TwoKey) => Boolean(r.adminApprovedAt);
+export const fullySigned = (r: TwoKey) => schoolSigned(r) && adminSigned(r);
+
+/** What is still outstanding, said the way a person would say it. */
+export function awaitingFrom(r: TwoKey): string {
+  if (fullySigned(r)) return '';
+  if (!schoolSigned(r) && !adminSigned(r)) return 'Waiting on the school and Glampter';
+  /* One key in. Naming the half that is already done is the difference between
+     "pending" and knowing who is actually being waited on. */
+  if (!schoolSigned(r)) return 'Glampter has approved - waiting on the school';
+  return 'The school has approved - waiting on Glampter';
+}
+
 /** BR-009 / BR-011: a school only ever touches its own records. */
 export function canReview(user: UserProfile, s: TeachingSession): boolean {
   if (user.role === 'admin') return true;

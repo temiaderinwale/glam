@@ -80,6 +80,29 @@ export function Kpi({ label, value, sub, accent = false, tone, icon: Icon }: {
   );
 }
 
+/** BR-027 / BR-028: who has signed and who has not. `sides` controls what the
+    viewer is entitled to see — a school is shown only its own decision, while
+    a teacher and the firm see both. */
+export function ApprovalPair({ school, admin, sides = 'both' }: {
+  school?: string; admin?: string; sides?: 'both' | 'school';
+}) {
+  const mark = (label: string, at?: string) => (
+    <span className="inline-flex items-center gap-1.5 text-xs"
+      style={{ color: at ? 'var(--ok)' : 'var(--text-3)' }}>
+      <span className="w-[7px] h-[7px] rotate-45 flex-none"
+        style={{ background: at ? 'var(--ok)' : 'transparent',
+                 border: at ? 'none' : '1.5px solid var(--text-3)' }} aria-hidden="true" />
+      {label} {at ? 'approved' : 'pending'}
+    </span>
+  );
+  return (
+    <span className="inline-flex flex-wrap items-center gap-x-4 gap-y-1">
+      {mark('School', school)}
+      {sides === 'both' ? mark('Glampter', admin) : null}
+    </span>
+  );
+}
+
 export function Badge({ tone = 'mute', children }: {
   tone?: 'ok' | 'warn' | 'bad' | 'info' | 'mute'; children: ReactNode;
 }) {
@@ -157,11 +180,14 @@ export function HBar({ pct, tone = 'accent', mark }: {
 export function TableWrap({ head, children, foot, minWidth = 640 }: {
   head: ReactNode[]; children: ReactNode; foot?: ReactNode; minWidth?: number;
 }) {
+  /* Alignment is no longer decided here: globals.css centres every header and
+     every cell, so a header cannot drift from its column and no page declares
+     it twice. */
   return (
     <div className="tbl-wrap">
       <table className="tbl" style={{ minWidth }}>
         <thead>
-          <tr>{head.map((h, i) => <th key={i} className={i > 0 ? 'text-right' : ''}>{h}</th>)}</tr>
+          <tr>{head.map((h, i) => <th key={i}>{h}</th>)}</tr>
         </thead>
         <tbody>{children}</tbody>
         {foot ? <tfoot>{foot}</tfoot> : null}
@@ -239,17 +265,33 @@ export function Modal({ open, onClose, title, sub, children, footer, wide = fals
   children: ReactNode; footer?: ReactNode; wide?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  /* Held in a ref so the effect below depends only on `open`. Every caller
+     passes an inline arrow, which is a fresh function on every render — with
+     onClose in the dependency list the effect re-ran after each keystroke and
+     moved the caret, which made the dialogs impossible to type in. */
+  const close = useRef(onClose);
+  close.current = onClose;
 
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close.current(); };
     document.addEventListener('keydown', onKey);
     const prev = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
-    window.setTimeout(() => ref.current?.querySelector<HTMLElement>(
-      'input,select,textarea,button')?.focus(), 30);
-    return () => { document.removeEventListener('keydown', onKey); document.body.style.overflow = prev; };
-  }, [open, onClose]);
+    /* The first *field*, not the first focusable thing: the header's close
+       button comes earlier in DOM order and is not where anyone wants to
+       start typing. Scoped to the body for the same reason. */
+    const t = window.setTimeout(() => {
+      bodyRef.current?.querySelector<HTMLElement>('input,select,textarea')?.focus();
+    }, 30);
+    return () => {
+      window.clearTimeout(t);
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [open]);
 
   if (!open) return null;
   return (
@@ -265,7 +307,7 @@ export function Modal({ open, onClose, title, sub, children, footer, wide = fals
             <X size={16} />
           </button>
         </header>
-        <div className="modal-body">{children}</div>
+        <div className="modal-body" ref={bodyRef}>{children}</div>
         {footer ? <footer className="modal-foot">{footer}</footer> : null}
       </div>
     </div>
@@ -302,7 +344,7 @@ export function Confirm({ open, onClose, onConfirm, title, body, confirmLabel = 
           <textarea id="confirm-reason" className="input" rows={3} value={reason}
             onChange={(e) => setReason(e.target.value)}
             placeholder="Say what is wrong, so it can be put right." />
-          {blocked ? <span className="field-hint">This is required — the reason goes to the teacher.</span> : null}
+          {blocked ? <span className="field-hint">Reason for closure is required</span> : null}
         </div>
       ) : null}
     </Modal>

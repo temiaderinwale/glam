@@ -83,7 +83,7 @@ export default function FinancialsPage() {
   return (
     <>
       <PageHead
-        title="Service &amp; financial report"
+        title="Financial overview"
         sub="Approved teaching hours, what they are worth to the firm, and what they cost to deliver."
         actions={
           <>

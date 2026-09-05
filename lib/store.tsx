@@ -20,7 +20,7 @@ import { auth, readProfile, endSession, firebaseReady } from './firebase';
 import type { Role, UserProfile } from './types';
 
 export type AuthStage =
-  | 'loading' | 'signedOut' | 'verify' | 'completeProfile' | 'pending' | 'ready';
+  | 'loading' | 'signedOut' | 'verify' | 'completeProfile' | 'pending' | 'blocked' | 'ready';
 
 type Ctx = {
   stage: AuthStage;
@@ -77,6 +77,12 @@ export function GlamProvider({ children }: { children: ReactNode }) {
 
     if (!p || !p.role) { setStage('completeProfile'); return; }
     if (p.status === 'pending') { setStage('pending'); return; }
+    /* A refused or frozen account must never reach 'ready'. 'ready' is what
+       switches the repository to Firestore, and firestore.rules grade every
+       read on status == 'active' — so a rejected account landed in the shell
+       and then had every query denied, which surfaced as an error overlay
+       rather than as the plain refusal it actually is. */
+    if (p.status === 'rejected' || p.status === 'suspended') { setStage('blocked'); return; }
     setStage('ready');
   }, []);
 

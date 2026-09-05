@@ -27,6 +27,10 @@
   --ok:#17703F;        --ok-soft:#E4F6EB;
   --warn:#9A5B00;      --warn-soft:#FFF2D8;
   --bad:#B0301B;       --bad-soft:#FDE9E4;
+  /* Withdrawing is not an error and not a rejection - it is a teacher ending
+     something they chose. Brown reads as deliberate rather than alarming, and
+     keeps the red reserved for the things that actually went wrong. */
+  --withdraw:#7A4A21;  --withdraw-soft:#F4ECE3;
   --info:#1E5FA8;      --info-soft:#E7F1FC;
 
   /* Surfaces — a white ground with warm tints for lift, not a flat cream field. */
@@ -67,6 +71,7 @@
   --ok:#6FBF8F;        --ok-soft:rgba(111,191,143,.14);
   --warn:#E9A62B;      --warn-soft:rgba(233,166,43,.14);
   --bad:#E08472;       --bad-soft:rgba(224,132,114,.14);
+  --withdraw:#C79A6C;  --withdraw-soft:rgba(199,154,108,.14);
   --info:#8FB4D8;      --info-soft:rgba(143,180,216,.14);
 
   --surface-3:#2C2619;
@@ -285,6 +290,12 @@ textarea:focus-visible,summary:focus-visible,[tabindex]:focus-visible{
   font-family:var(--font-archivo),sans-serif;font-size:11px;font-weight:700;
   letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--border);white-space:nowrap}
 .tbl td{padding:12px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
+/* Every table reads centred, header and body alike. Written with the element
+   names included so it outranks the per-cell .num and .text-right a few pages
+   still carry, without reaching for !important. */
+.tbl thead th,
+.tbl tbody td,
+.tbl tfoot td{text-align:center}
 .tbl tbody tr:last-child td{border-bottom:none}
 .tbl tbody tr:hover{background:var(--surface-2)}
 .tbl tfoot td{padding:12px 14px;background:var(--surface-2);font-weight:700;

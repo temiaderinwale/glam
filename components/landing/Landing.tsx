@@ -488,7 +488,8 @@ export default function Landing() {
             <div className="mt-8 flex flex-wrap gap-3 justify-center">
               <Link href="/auth?tab=register" className="btn btn-gold">Get started</Link>
               <Link href="/auth" className="btn btn-ghost">Sign in</Link>
-              <Link href="/dashboard" className="btn btn-ghost">Preview Dashboard</Link>
+              {/* The only entry point that unlocks the preview — see AppShell. */}
+              <Link href="/dashboard?preview=1" className="btn btn-ghost">Preview Dashboard</Link>
             </div>
           </div>
         </Reveal>

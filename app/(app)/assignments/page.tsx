@@ -6,7 +6,7 @@
 import { useMemo, useState } from 'react';
 import { Check, Link2, PlusCircle, Search, X } from 'lucide-react';
 import {
-  Badge, ChipPicker, Confirm, EmptyState, Kpi, KpiGrid, Modal, PageHead, Pager,
+  ApprovalPair, Badge, ChipPicker, Confirm, EmptyState, Kpi, KpiGrid, Modal, PageHead, Pager,
   SearchBox, Select, TableWrap, TextArea, TextInput, Toolbar, usePaged
 } from '@/components/ui';
 import { useActor, useData } from '@/lib/data';
@@ -15,7 +15,7 @@ import type { Assignment } from '@/lib/types';
 
 export default function AssignmentsPage() {
   const actor = useActor();
-  const { data, saveAssignment, decideAssignment, today } = useData();
+  const { data, saveAssignment, decideAssignment, signAssignment, awaiting, today } = useData();
   const [q, setQ] = useState('');
   const [status, setStatus] = useState('all');
   const [form, setForm] = useState<Partial<Assignment> | null>(null);
@@ -79,13 +79,19 @@ export default function AssignmentsPage() {
                     {a.notes ? ` · “${a.notes}”` : ''}
                   </p>
                 </div>
-                <div className="flex gap-2">
-                  <button className="btn btn-ghost btn-sm" onClick={() => setDeclining(a)}>
-                    <X size={14} /> Decline
-                  </button>
-                  <button className="btn btn-primary btn-sm" onClick={() => void decideAssignment(a.id, 'active')}>
-                    <Check size={14} /> Approve
-                  </button>
+                <div className="flex flex-col items-end gap-2">
+                  <ApprovalPair school={a.schoolApprovedAt} admin={a.adminApprovedAt} />
+                  <div className="flex gap-2">
+                    <button className="btn btn-ghost btn-sm" onClick={() => setDeclining(a)}>
+                      <X size={14} /> Reject
+                    </button>
+                    <button className="btn btn-primary btn-sm"
+                      disabled={Boolean(a.adminApprovedAt)}
+                      title={a.adminApprovedAt ? 'Glampter has already approved this' : awaiting(a)}
+                      onClick={() => void signAssignment(a.id, true)}>
+                      <Check size={14} /> {a.adminApprovedAt ? 'Approved' : 'Approve'}
+                    </button>
+                  </div>
                 </div>
               </div>
             ))}
@@ -195,7 +201,7 @@ export default function AssignmentsPage() {
         title="Decline this request" tone="danger" confirmLabel="Decline request"
         reasonLabel="Reason sent to the teacher"
         body="The teacher is notified with your reason."
-        onConfirm={(reason) => { if (declining) void decideAssignment(declining.id, 'rejected', reason); }} />
+        onConfirm={(reason) => { if (declining) void signAssignment(declining.id, false, reason); }} />
     </>
   );
 }

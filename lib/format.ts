@@ -30,6 +30,21 @@ export function duration(minutes: number) {
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const MONTHS_FULL = ['January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'];
+
+/** 1st, 2nd, 3rd, 4th … 21st. The teens are the exception that catches people. */
+function ordinal(n: number): string {
+  const v = n % 100;
+  if (v >= 11 && v <= 13) return n + 'th';
+  return n + (['th', 'st', 'nd', 'rd'][n % 10] ?? 'th');
+}
+
+/** 5th September — the date written the way it is spoken. */
+export function dateFull(iso: string): string {
+  const d = new Date(iso + 'T00:00:00');
+  return ordinal(d.getDate()) + ' ' + MONTHS_FULL[d.getMonth()];
+}
 
 /** 24 Aug 2026 */
 export function dateLong(iso: string) {
@@ -108,6 +123,35 @@ export function fileSize(bytes: number) {
   if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
   if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${bytes} B`;
+}
+
+/* The greeting is read off the organisation's clock, not the visitor's and not
+   the server's. Two reasons, and the second is the one that bites:
+
+     • the firm works out of Ogun State, so "morning" means morning there;
+     • NEXT_PUBLIC builds render on a host that is very often in another
+       timezone, and a greeting computed from the machine's local hour would
+       differ between the server pass and hydration — the same class of
+       mismatch that broke this app once already. Pinning the zone makes both
+       sides agree by construction. */
+
+/** The hour, 0–23, on the organisation's clock. */
+export function orgHour(timezone = 'Africa/Lagos', now = new Date()): number {
+  try {
+    const h = Number(new Intl.DateTimeFormat('en-GB', {
+      timeZone: timezone, hour: '2-digit', hour12: false
+    }).format(now));
+    return Number.isFinite(h) ? h % 24 : now.getHours();
+  } catch {
+    return now.getHours();
+  }
+}
+
+/** Morning until noon, afternoon until 17:00, evening after that. */
+export function greeting(hour = orgHour()): string {
+  if (hour < 12) return 'Good morning';
+  if (hour < 17) return 'Good afternoon';
+  return 'Good evening';
 }
 
 /** Today in the organisation's timezone, as YYYY-MM-DD. */

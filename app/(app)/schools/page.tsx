@@ -82,7 +82,7 @@ export default function SchoolsPage() {
         } />
 
       <KpiGrid cols={4} className="mb-6">
-        <Kpi label="Active schools" value={String(data.schools.filter((s) => s.status === 'active').length)} sub="under service" tone="ok" />
+        <Kpi label="Active schools" value={String(data.schools.filter((s) => s.status === 'active').length)} tone="ok" />
         <Kpi label="Awaiting approval" value={String(pending.length)} sub="registered, not yet activated" tone={pending.length ? 'warn' : undefined} />
         <Kpi label="Approved this month" value={hoursLabel(approvedMinutes(month))} sub="all schools" />
         <Kpi label="Contracted hours" value={String(data.schools.reduce((a, s) => a + (s.status === 'active' ? s.contractedHours : 0), 0))} sub="monthly allocation" tone="info" />

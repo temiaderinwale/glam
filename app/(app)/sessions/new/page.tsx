@@ -38,7 +38,7 @@ export default function LogSessionPage() {
   if (actor.role !== 'teacher') {
     return (
       <>
-        <PageHead title="Log teaching session" />
+        <PageHead title="Clock Period" />
         <EmptyState title="Only teachers log sessions"
           text="Switch to the teacher view to record a class. Schools confirm sessions from the approval queue; administrators can correct them from teaching history."
           action={<Link href="/approvals" className="btn btn-primary btn-sm">Open approval queue</Link>} />
@@ -72,14 +72,14 @@ export default function LogSessionPage() {
   return (
     <>
       <PageHead
-        title="Log teaching session"
+        title="Clock Period"
         sub="Record the class while it is fresh. Duration is worked out from the times you enter."
       />
 
       {!assigned.length ? (
         <EmptyState title="No active school assignments"
           text="You can only submit sessions to schools you are assigned to. Request one and Glampter will review it."
-          action={<Link href="/my-schools" className="btn btn-primary btn-sm">Request a school</Link>} />
+          action={<Link href="/my-schools" className="btn btn-primary btn-sm">Request to teach in a school</Link>} />
       ) : (
         <div className="max-w-[720px]">
           <Frame brackets>

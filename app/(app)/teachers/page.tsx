@@ -9,6 +9,7 @@ import {
   SearchBox, Select, TableWrap, TextArea, TextInput, Toolbar, usePaged
 } from '@/components/ui';
 import { approvalRate, approvedMinutes, inMonth, pendingMinutes } from '@/lib/compute';
+import AssignmentQueue from '@/components/AssignmentQueue';
 import { useActor, useData } from '@/lib/data';
 import { dateLong, hoursLabel, money, pct } from '@/lib/format';
 import { exportRows } from '@/lib/csv';
@@ -59,6 +60,8 @@ export default function TeachersPage() {
 
   return (
     <>
+      <AssignmentQueue />
+
       <PageHead title="Teachers"
         sub={actor.role === 'admin'
           ? 'Everyone teaching under Glampter, and who is waiting to be approved.'

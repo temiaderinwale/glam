@@ -28,10 +28,20 @@ export type UserProfile = {
   /* School accounts: the administrator who owns the login. */
   contactFirstName?: string;
   contactSurname?: string;
-  /* Admin accounts only. Mirrors AdminAccount.level so a sign-in can be graded
-     before the org's collections have loaded. */
+  /* Admin accounts only. users/{uid} is the source of truth for a live
+     administrator — the org roster is demo data — so the profile carries the
+     whole grade, not just a hint of it. */
   adminLevel?: AdminLevel;
   adminId?: string;
+  /** Who granted super status. BR-023 reads this to refuse acting on them. */
+  promotedBy?: string;
+  /** The first administrator ever registered. BR-024 makes them untouchable. */
+  founder?: boolean;
+  /* Closing an account is a request, not an action: the holder asks, a super
+     admin decides. BR-025. */
+  deleteRequestedAt?: string;
+  deleteRequestReason?: string;
+  deletedAt?: string;
   email: string;
   phone: string;
   photoURL?: string;
@@ -106,8 +116,15 @@ export type Assignment = {
   startDate: string;
   endDate?: string;
   assignedBy: string;
-  /** requested → active means the admin approved a teacher's request. */
+  /** requested → active once BOTH sides below have signed off. */
   status: 'requested' | 'active' | 'ended' | 'rejected';
+  /* BR-027: a teacher joining a school is two decisions, not one — the school
+     accepts them into the building, and the firm accepts the placement. Each
+     is stamped separately and the assignment is only active with both. */
+  schoolApprovedAt?: string;
+  schoolApprovedBy?: string;
+  adminApprovedAt?: string;
+  adminApprovedBy?: string;
   origin: 'admin' | 'teacher-request' | 'school-request';
   notes?: string;
   createdAt: string;
@@ -145,6 +162,12 @@ export type TeachingSession = {
   correctionReason?: string;
   cancelReason?: string;
   submittedAt?: string;
+  /* BR-028: a period is validated service only once the school confirms it
+     happened AND the firm accepts it. Same two-key shape as an assignment. */
+  schoolApprovedAt?: string;
+  schoolApprovedBy?: string;
+  adminApprovedAt?: string;
+  adminApprovedBy?: string;
   reviewedAt?: string;
   reviewedBy?: string;
   flags?: SessionFlag[];
@@ -181,7 +204,8 @@ export type NotificationKind =
   | 'session-submitted' | 'session-approved' | 'session-rejected'
   | 'session-correction' | 'session-resubmitted'
   | 'account-approved' | 'assignment-created' | 'assignment-requested'
-  | 'registration-received' | 'stale-approval';
+  | 'registration-received' | 'stale-approval'
+  | 'account-delete-requested';
 
 export type Notification = {
   id: string;

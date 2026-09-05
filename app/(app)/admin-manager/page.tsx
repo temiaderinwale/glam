@@ -32,21 +32,21 @@ const STATUS_LABEL: Record<AccountStatus, string> = {
 type Pending = { admin: AdminAccount; kind: 'suspend' | 'deactivate' };
 
 export default function AdminManagerPage() {
-  const { data, myAdmin, isSuperAdmin, adminIssue, setAdminStatus, promoteAdmin } = useData();
+  const { adminRoster, myAdmin, isSuperAdmin, adminIssue, setAdminStatus, promoteAdmin } = useData();
   const [q, setQ] = useState('');
   const [status, setStatus] = useState('all');
   const [confirm, setConfirm] = useState<Pending | null>(null);
 
   const rows = useMemo(() => {
     const needle = q.trim().toLowerCase();
-    return data.admins
+    return adminRoster
       .filter((a) => status === 'all' || a.status === status)
       .filter((a) => !needle || [a.id, a.name, a.email, a.phone].join(' ').toLowerCase().includes(needle))
       /* Whoever still needs a decision comes first — the queue is the job. */
       .sort((a, b) =>
         Number(b.status === 'pending') - Number(a.status === 'pending') ||
         a.name.localeCompare(b.name));
-  }, [data.admins, q, status]);
+  }, [adminRoster, q, status]);
 
   const paged = usePaged(rows, 12);
 
@@ -61,7 +61,7 @@ export default function AdminManagerPage() {
     );
   }
 
-  const nameOf = (id?: string) => data.admins.find((a) => a.id === id)?.name;
+  const nameOf = (id?: string) => adminRoster.find((a) => a.id === id)?.name;
 
   /** A button that carries its own refusal instead of vanishing. */
   const Action = ({ admin, action, label, icon: Icon, tone, onGo }: {
@@ -83,9 +83,9 @@ export default function AdminManagerPage() {
   };
 
   const counts = {
-    total: data.admins.length,
-    pending: data.admins.filter((a) => a.status === 'pending').length,
-    supers: data.admins.filter((a) => a.level === 'super' && a.status === 'active').length
+    total: adminRoster.length,
+    pending: adminRoster.filter((a) => a.status === 'pending').length,
+    supers: adminRoster.filter((a) => a.level === 'super' && a.status === 'active').length
   };
 
   return (

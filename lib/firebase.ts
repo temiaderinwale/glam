@@ -13,7 +13,10 @@ import {
   createUserWithEmailAndPassword, sendEmailVerification, sendPasswordResetEmail,
   updateProfile, signOut, type Auth, type User
 } from 'firebase/auth';
-import { getFirestore, doc, getDoc, setDoc, serverTimestamp, type Firestore } from 'firebase/firestore';
+import {
+  getFirestore, collection, deleteField, doc, getDoc, getDocs, onSnapshot, query,
+  setDoc, serverTimestamp, where, type Firestore
+} from 'firebase/firestore';
 import type { AdminLevel, Role, UserProfile } from './types';
 
 const cfg = {
@@ -102,6 +105,126 @@ async function claimFounder(uid: string): Promise<boolean> {
 export async function founderExists(): Promise<boolean> {
   if (!db) return false;
   try { return (await getDoc(FOUNDER_DOC())).exists(); } catch { return false; }
+}
+
+/* ---------- The live administrator roster ----------
+
+   users/{uid} is the source of truth for a real account: it is what
+   registration writes and what firestore.rules grades people by. The org's
+   `admins` collection is demo data for preview, and the two are deliberately
+   not synchronised — one is real, one is a fixture. */
+
+/** Every identity document. The rules let an administrator read them all, which
+    is what the firm's registration and deletion queues are built from. */
+export function watchUsers(onRows: (rows: UserProfile[]) => void): () => void {
+  if (!db) return () => {};
+  try {
+    return onSnapshot(
+      collection(db, 'users'),
+      (snap) => onRows(snap.docs.map((d) => d.data() as UserProfile)),
+      () => { /* denied until rules are deployed; preview data stands in */ }
+    );
+  } catch { return () => {}; }
+}
+
+/** What the account holder may change about themselves. Never the email — that
+    is the identity Firebase Auth signed them in with — and never their own
+    role, status or grade, which firestore.rules refuses anyway. */
+export async function saveOwnProfile(
+  uid: string,
+  patch: Pick<Partial<UserProfile>,
+    'displayName' | 'firstName' | 'surname' | 'contactFirstName' | 'contactSurname' | 'phone'>
+): Promise<void> {
+  if (!db) return;
+  await setDoc(doc(db, 'users', uid),
+    { ...patch, updatedAt: new Date().toISOString() }, { merge: true });
+}
+
+/* ---------- BR-025: closing an account is a request, not an action ----------
+
+   The holder asks; a super admin decides. Nothing is destroyed on approval
+   either: the account is deactivated and stamped, so the teaching history it
+   is attached to still reconciles. Removing the Firebase Auth user itself
+   needs the Admin SDK and cannot be done from a browser — see README. */
+
+/** A refused account asks to be looked at again. Only rejected → pending, and
+    only for yourself; firestore.rules enforces both. */
+export async function reRequestApproval(uid: string): Promise<void> {
+  if (!db) return;
+  await setDoc(doc(db, 'users', uid),
+    { status: 'pending', updatedAt: new Date().toISOString() }, { merge: true });
+}
+
+export async function requestAccountDeletion(uid: string, reason: string): Promise<void> {
+  if (!db) return;
+  await setDoc(doc(db, 'users', uid), {
+    deleteRequestedAt: new Date().toISOString(),
+    deleteRequestReason: reason
+  }, { merge: true });
+}
+
+export async function resolveAccountDeletion(uid: string, approve: boolean): Promise<void> {
+  if (!db) return;
+  await setDoc(doc(db, 'users', uid), approve
+    ? {
+        status: 'rejected',
+        deletedAt: new Date().toISOString(),
+        deleteRequestedAt: deleteField(),
+        deleteRequestReason: deleteField()
+      }
+    : { deleteRequestedAt: deleteField(), deleteRequestReason: deleteField() },
+    { merge: true });
+}
+
+/** A super admin's decision about somebody else's account. */
+export async function writeAdminGrade(
+  uid: string,
+  /* teacherId/schoolId are here because approving an account is also what
+     binds it to its org record — without that link the rules cannot match a
+     teacher to the assignment they are creating. */
+  patch: Pick<Partial<UserProfile>,
+    'status' | 'adminLevel' | 'promotedBy' | 'teacherId' | 'schoolId'>
+): Promise<void> {
+  if (!db) return;
+  await setDoc(doc(db, 'users', uid), { ...patch, updatedAt: new Date().toISOString() }, { merge: true });
+}
+
+/* Claims the founder slot, or repairs a profile that should already hold it.
+
+   Registration tries this once, but it can legitimately fail there — the rules
+   may not have been deployed yet, or the write may have raced. Rather than
+   leave a platform with no super admin and no way to make one, the first
+   administrator to sign in settles it. bootstrap/platform is create-only, so
+   "first" still means first: a second claimant's write is rejected. */
+export async function ensureFounder(profile: UserProfile): Promise<boolean> {
+  if (!db || profile.role !== 'admin') return false;
+  try {
+    const snap = await getDoc(FOUNDER_DOC());
+
+    if (!snap.exists()) {
+      /* Nobody holds it. Only claim when no other administrator was registered
+         first, so a later sign-in cannot leapfrog the real first account. */
+      const others = await getDocs(query(collection(db, 'users'), where('role', '==', 'admin')));
+      const earliest = others.docs
+        .map((d) => d.data() as UserProfile)
+        .filter((p) => p.createdAt)
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+      if (earliest && earliest.uid !== profile.uid) return false;
+
+      await setDoc(FOUNDER_DOC(), { founderUid: profile.uid, claimedAt: serverTimestamp() });
+    } else if (snap.data()?.founderUid !== profile.uid) {
+      return false;
+    }
+
+    /* Holder confirmed. Make the profile say so, if it does not already. */
+    if (profile.adminLevel !== 'super' || profile.status !== 'active' || !profile.founder) {
+      await setDoc(doc(db, 'users', profile.uid),
+        { adminLevel: 'super', status: 'active', founder: true }, { merge: true });
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /* ---------- Auth actions. Each throws a FirebaseError the UI maps via

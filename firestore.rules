@@ -88,6 +88,27 @@ service cloud.firestore {
                     && resource.data.role != 'admin'
                     && request.resource.data.get('adminLevel', 'standard') == 'standard';
       allow update: if isSuperAdmin();
+
+      /* BR-026: a refused account may ask to be reconsidered — and that is the
+         only status change it can make to itself. Rejected back to pending,
+         nothing else: it cannot activate itself, change its role, or touch its
+         administrative grade. */
+      allow update: if signedIn() && request.auth.uid == uid
+                    && resource.data.status == 'rejected'
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.role == resource.data.role
+                    && request.resource.data.get('adminLevel', 'standard')
+                       == resource.data.get('adminLevel', 'standard');
+
+      /* The founder settles their own grade. Registration tries to do this, but
+         that attempt can fail — rules not yet deployed, or a lost race — and a
+         platform with no super admin has no way to appoint one. Narrow on
+         purpose: only the single holder of bootstrap/platform, only their own
+         document, and only to exactly active + super. */
+      allow update: if signedIn() && request.auth.uid == uid && isFounder()
+                    && request.resource.data.role == 'admin'
+                    && request.resource.data.status == 'active'
+                    && request.resource.data.adminLevel == 'super';
       allow delete: if false;
     }
 
@@ -171,6 +192,47 @@ service cloud.firestore {
         allow create: if myOrg(orgId) && isTeacher()
                       && request.resource.data.teacherId == me().teacherId
                       && request.resource.data.status == 'requested';
+
+        /* BR-027: the request needs two keys, so the school has to be able to
+           turn its own. It may stamp its approval or reject the request, and
+           nothing else - it cannot move the request to another school, put it
+           on another teacher, or forge the firm's key, because those fields are
+           outside changed(). And it can only reach 'active' when the firm has
+           already signed, so a school still cannot place a teacher by itself. */
+        allow update: if myOrg(orgId) && isSchool()
+                      && resource.data.schoolId == me().schoolId
+                      && request.resource.data.schoolId == resource.data.schoolId
+                      && request.resource.data.teacherId == resource.data.teacherId
+                      && changed(['status', 'schoolApprovedAt', 'schoolApprovedBy', 'notes'])
+                      && request.resource.data.status in ['requested', 'active', 'rejected']
+                      && (request.resource.data.status != 'active'
+                          || request.resource.data.get('adminApprovedAt', '') != '');
+
+        /* A teacher governs two things about their own placement, and nothing
+           else. They may WITHDRAW from a school - ending their own placement,
+           never reviving or moving it - and they may REVISE what they cover,
+           which puts the request back to both signatories with the two keys
+           cleared. Widening your own coverage without re-approval would let a
+           teacher grant themselves subjects nobody agreed to, and BR-002 grades
+           every session against exactly this record. */
+        allow update: if myOrg(orgId) && isTeacher()
+                      && resource.data.teacherId == me().teacherId
+                      && request.resource.data.teacherId == resource.data.teacherId
+                      && request.resource.data.schoolId == resource.data.schoolId
+                      && changed(['status', 'endDate', 'notes'])
+                      && request.resource.data.status == 'ended';
+
+        allow update: if myOrg(orgId) && isTeacher()
+                      && resource.data.teacherId == me().teacherId
+                      && request.resource.data.teacherId == resource.data.teacherId
+                      && request.resource.data.schoolId == resource.data.schoolId
+                      && changed(['status', 'subjects', 'classes', 'notes',
+                                  'schoolApprovedAt', 'schoolApprovedBy',
+                                  'adminApprovedAt', 'adminApprovedBy'])
+                      && request.resource.data.status == 'requested'
+                      && request.resource.data.get('schoolApprovedAt', '') == ''
+                      && request.resource.data.get('adminApprovedAt', '') == '';
+
         allow update, delete: if isAdmin() && myOrg(orgId);
       }
 

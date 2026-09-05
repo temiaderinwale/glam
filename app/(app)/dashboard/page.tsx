@@ -5,26 +5,27 @@
    is written into the JSX, which is why this page and /financials reconcile. */
 
 import Link from 'next/link';
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle, BarChart3, Building2, CalendarCheck, CheckCircle2, ClipboardCheck,
-  Clock, FileWarning, GraduationCap, Inbox, PlusCircle, TrendingUp, Users
+  Clock, FileWarning, GraduationCap, Inbox, PlusCircle, TrendingUp, UserPlus, Users, X
 } from 'lucide-react';
 import {
-  Badge, EmptyState, Frame, Kpi, KpiGrid, LifecycleRail, PageHead, SectionHead,
-  Skeleton, TableWrap, railFor
+  ApprovalPair, Badge, EmptyState, Frame, Kpi, KpiGrid, LifecycleRail, PageHead,
+  SectionHead, Skeleton, TableWrap, railFor
 } from '@/components/ui';
 import {
   STATUS_LABEL, STATUS_TONE, approvalRate, approvedMinutes, dailySeries, groupMinutes,
-  inLastDays, inMonth, isPending, minutes, needsTeacherAction, onDate, stalePending
+  inLastDays, inMonth, isPending, minutes, needsTeacherAction, onDate
 } from '@/lib/compute';
-import { useActor, useData } from '@/lib/data';
-import { ago, dateShort, hours, hoursLabel, pct } from '@/lib/format';
+import AssignmentQueue from '@/components/AssignmentQueue';
+ import { useActor, useData } from '@/lib/data';
+import { ago, dateFull, dateShort, greeting, hours, hoursLabel, orgHour, pct } from '@/lib/format';
 import { useGlam } from '@/lib/store';
-import type { TeachingSession } from '@/lib/types';
+import type { Assignment, TeachingSession, UserProfile } from '@/lib/types';
 
 export default function DashboardPage() {
-  const { role, preview } = useGlam();
+  const { role } = useGlam();
   const { ready } = useData();
 
   if (!ready) {
@@ -40,12 +41,6 @@ export default function DashboardPage() {
 
   return (
     <>
-      {preview ? (
-        <p className="preview-chip mb-5 no-print">
-          Preview — demo data, no account signed in.{' '}
-          <Link href="/auth" className="underline underline-offset-2">Sign in</Link>
-        </p>
-      ) : null}
       {role === 'teacher' ? <TeacherView /> : role === 'school' ? <SchoolView /> : <AdminView />}
     </>
   );
@@ -53,7 +48,41 @@ export default function DashboardPage() {
 
 /* ================= Teacher ================= */
 
+/* ---------- who is being greeted, and when ---------- */
+
+/* Seeded with the same value the server rendered, then corrected on mount and
+   kept honest every minute, so a dashboard left open overnight does not still
+   say good afternoon. */
+function useGreeting() {
+  const [hour, setHour] = useState(() => orgHour());
+  useEffect(() => {
+    setHour(orgHour());
+    const id = window.setInterval(() => setHour(orgHour()), 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+  return greeting(hour);
+}
+
+/* The name on the account, not the name on a demo record. A school registers
+   under the school's name, so the person to greet is the administrator who
+   owns the login. */
+function useFirstName() {
+  const { profile } = useGlam();
+  const actor = useActor();
+  const source =
+    profile?.firstName?.trim()
+    || profile?.contactFirstName?.trim()
+    || (profile?.role === 'school' ? '' : profile?.displayName?.trim())
+    || actor.firstName?.trim()
+    || actor.contactFirstName?.trim()
+    || (actor.role === 'school' ? '' : actor.displayName?.trim())
+    || '';
+  return source.split(/\s+/)[0] || 'there';
+}
+
 function TeacherView() {
+  const hello = useGreeting();
+  const firstName = useFirstName();
   const actor = useActor();
   const { data, mySessions, today: TODAY } = useData();
   const mine = useMemo(
@@ -73,15 +102,17 @@ function TeacherView() {
   return (
     <>
       <PageHead
-        title={`Good afternoon, ${(teacher?.name ?? 'there').split(' ')[0]}`}
-        sub={`Your teaching for ${dateShort(TODAY)}. Log a session as soon as the period ends — it takes under a minute.`}
+        title={`${hello}, ${firstName}`}
+        sub={`Your teaching for ${dateFull(TODAY)}. Clock a period as soon as the period ends - it takes under a minute.`}
         actions={<Link href="/sessions/new" className="btn btn-primary">
-          <PlusCircle size={16} aria-hidden="true" /> Log teaching session
+          <PlusCircle size={16} aria-hidden="true" /> Clock Period
         </Link>}
       />
 
+      <MyRequests />
+
       <KpiGrid cols={3} className="mb-6">
-        <Kpi label="Today" value={hours(minutes(today))} sub={`${today.length} session${today.length === 1 ? '' : 's'}`} accent icon={Clock} />
+        <Kpi label="Today" value={hours(minutes(today))} sub={`${today.length} Period${today.length === 1 ? '' : 's'}`} accent icon={Clock} />
         <Kpi label="This week" value={hours(minutes(week))} sub="last 7 days" icon={CalendarCheck} />
         <Kpi label="This month" value={hours(minutes(month))} sub="all statuses" icon={BarChart3} />
         <Kpi label="Pending approval" value={String(mine.filter(isPending).length)} sub="waiting on schools" tone="warn" icon={Inbox} />
@@ -192,6 +223,8 @@ function SessionCard({ s }: { s: TeachingSession }) {
 /* ================= School ================= */
 
 function SchoolView() {
+  const hello = useGreeting();
+  const firstName = useFirstName();
   const actor = useActor();
   const { data, mySessions, today: TODAY } = useData();
   const mine = useMemo(
@@ -219,12 +252,14 @@ function SchoolView() {
   return (
     <>
       <PageHead
-        title={school?.name ?? 'Your school'}
+        title={`${hello}, ${firstName}`}
         sub="Confirm what was delivered. Approving a session makes it an official record; rejecting one always needs a reason."
         actions={<Link href="/approvals" className="btn btn-primary">
           <ClipboardCheck size={16} aria-hidden="true" /> Review queue ({queue.length})
         </Link>}
       />
+
+      <AssignmentQueue />
 
       <KpiGrid cols={3} className="mb-6">
         <Kpi label="Awaiting your approval" value={String(queue.length)} sub="oldest first" tone="warn" icon={Inbox} />
@@ -297,11 +332,11 @@ function SchoolView() {
 /* ================= Administrator ================= */
 
 function AdminView() {
+  const hello = useGreeting();
+  const firstName = useFirstName();
   const { data, mySessions, today: TODAY } = useData();
   const all = mySessions;
   const month = inMonth(all);
-  const stale = stalePending(all, data.settings.approvalSlaHours);
-  const pending = all.filter(isPending);
   const bySchool = groupMinutes(month, (s) => s.schoolName, true);
   const byTeacher = groupMinutes(month, (s) => s.teacherName, true).slice(0, 6);
   const maxSchool = Math.max(1, ...bySchool.map((b) => b.minutes));
@@ -311,43 +346,24 @@ function AdminView() {
     .sort((a, b) => (b.submittedAt ?? '').localeCompare(a.submittedAt ?? ''))
     .slice(0, 7);
 
-  /* Exceptions first, and every count is a live query rather than a stored
-     figure — a dashboard that can disagree with its own modules is worse than
-     no dashboard. */
-  const alerts = [
-    { n: pending.length, label: 'Sessions pending approval', href: '/approvals' },
-    { n: stale.length, label: `Pending over ${data.settings.approvalSlaHours} hours`, href: '/approvals' },
-    { n: data.teachers.filter((t) => t.status === 'pending').length, label: 'Teacher registrations to review', href: '/teachers' },
-    { n: data.assignments.filter((a) => a.status === 'requested').length, label: 'Assignment requests', href: '/assignments' },
-    { n: all.filter((s) => s.flags?.length && isPending(s)).length, label: 'Flagged duplicates and overlaps', href: '/approvals' }
-  ];
-
   return (
     <>
       <PageHead
-        title="Operations"
+        title={`${hello}, ${firstName}`}
         sub="Exceptions first. Everything below is drawn from approved teaching records across every school."
         actions={<Link href="/financials" className="btn btn-primary">
-          <BarChart3 size={16} aria-hidden="true" /> Service &amp; financial report
+          <BarChart3 size={16} aria-hidden="true" /> Financial overview
         </Link>}
       />
 
-      <section className="mb-6">
-        <SectionHead title="Needs attention" icon={AlertTriangle} />
-        <div className="kpi-grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
-          {alerts.map((a) => (
-            <Link key={a.label} href={a.href} className={`kpi ${a.n ? 'kpi-warn' : ''}`}>
-              <span className="kpi-value" style={{ color: a.n ? 'var(--warn)' : 'var(--text-3)' }}>{a.n}</span>
-              <span className="kpi-sub">{a.label}</span>
-            </Link>
-          ))}
-        </div>
-      </section>
+      <SignupQueue />
+      <AssignmentQueue />
+      <ClosureQueue />
 
       <KpiGrid cols={4} className="mb-6">
-        <Kpi label="Active schools" value={String(data.schools.filter((s) => s.status === 'active').length)} sub="under service" icon={Building2} />
-        <Kpi label="Active teachers" value={String(data.teachers.filter((t) => t.status === 'active').length)} sub="assigned and teaching" icon={GraduationCap} />
-        <Kpi label="Approved this month" value={hours(approvedMinutes(month))} sub="validated delivery" tone="ok" icon={CheckCircle2} />
+        <Kpi label="Active schools" value={String(data.schools.filter((s) => s.status === 'active').length)} icon={Building2} />
+        <Kpi label="Active teachers" value={String(data.teachers.filter((t) => t.status === 'active').length)} icon={GraduationCap} />
+        <Kpi label="Approved this month" value={hours(approvedMinutes(month))} sub="across all schools" tone="ok" icon={CheckCircle2} />
         <Kpi label="Approval rate" value={pct(approvalRate(all))} sub="across all schools" tone="info" icon={BarChart3} />
       </KpiGrid>
 
@@ -400,5 +416,139 @@ function AdminView() {
         </TableWrap>
       </section>
     </>
+  );
+}
+
+/* ---------- Live registration queue ----------
+
+   Real accounts, not demo records: these are users/{uid} documents written by
+   registration, so a teacher who signed up ten seconds ago is in this list. It
+   renders nothing at all when the queue is empty, because an empty queue is
+   not news. */
+
+function WhoRow({ u, children }: { u: UserProfile; children: React.ReactNode }) {
+  return (
+    <tr>
+      <td>
+        <div className="font-semibold">{u.displayName || u.email}</div>
+        <div className="text-xs text-[var(--text-2)]">{u.email}</div>
+      </td>
+      <td><Badge tone={u.role === 'school' ? 'info' : 'mute'}>
+        {u.role === 'school' ? 'School' : u.role === 'admin' ? 'Administrator' : 'Teacher'}
+      </Badge></td>
+      <td className="text-sm text-[var(--text-2)]">{u.phone || '—'}</td>
+      <td className="text-sm text-[var(--text-2)]">
+        {u.createdAt ? dateShort(u.createdAt.slice(0, 10)) : '—'}
+      </td>
+      <td>{children}</td>
+    </tr>
+  );
+}
+
+function SignupQueue() {
+  const { pendingSignups, decideRegistration } = useData();
+  if (!pendingSignups.length) return null;
+
+  return (
+    <section className="mb-6">
+      <SectionHead title="Registrations awaiting approval" icon={UserPlus}
+        right={`${pendingSignups.length} waiting`} />
+      <TableWrap minWidth={760} head={['Who', 'Type', 'Phone', 'Registered', 'Decision']}>
+        {pendingSignups.map((u) => (
+          <WhoRow key={u.uid} u={u}>
+            <div className="flex flex-wrap gap-1.5">
+              <button className="btn btn-ghost btn-sm"
+                onClick={() => void decideRegistration(u.uid, true)}>
+                <CheckCircle2 size={14} strokeWidth={2} aria-hidden="true" /> Approve
+              </button>
+              <button className="btn btn-ghost btn-sm" style={{ color: 'var(--bad)' }}
+                onClick={() => void decideRegistration(u.uid, false)}>
+                <X size={14} strokeWidth={2} aria-hidden="true" /> Reject
+              </button>
+            </div>
+          </WhoRow>
+        ))}
+      </TableWrap>
+    </section>
+  );
+}
+
+/* ---------- BR-025: closures, which only a super admin may answer ---------- */
+
+function ClosureQueue() {
+  const { deleteRequests, decideDeletion, isSuperAdmin } = useData();
+  if (!deleteRequests.length) return null;
+
+  return (
+    <section className="mb-6">
+      <SectionHead title="Account closures requested" icon={AlertTriangle}
+        right={isSuperAdmin ? `${deleteRequests.length} to decide` : 'super admins decide these'} />
+      <TableWrap minWidth={760} head={['Who', 'Type', 'Phone', 'Asked', 'Decision']}>
+        {deleteRequests.map((u) => (
+          <WhoRow key={u.uid} u={u}>
+            <div>
+              {u.deleteRequestReason ? (
+                <p className="text-xs text-[var(--text-2)] mb-1.5 max-w-[32ch]">{u.deleteRequestReason}</p>
+              ) : null}
+              <div className="flex flex-wrap gap-1.5">
+                <button className="btn btn-ghost btn-sm" disabled={!isSuperAdmin}
+                  title={isSuperAdmin ? 'Approve closure' : 'Only a super admin can decide this'}
+                  style={isSuperAdmin ? { color: 'var(--bad)' } : undefined}
+                  onClick={() => void decideDeletion(u.uid, true)}>
+                  <CheckCircle2 size={14} strokeWidth={2} aria-hidden="true" /> Approve closure
+                </button>
+                <button className="btn btn-ghost btn-sm" disabled={!isSuperAdmin}
+                  title={isSuperAdmin ? 'Decline' : 'Only a super admin can decide this'}
+                  onClick={() => void decideDeletion(u.uid, false)}>
+                  <X size={14} strokeWidth={2} aria-hidden="true" /> Decline
+                </button>
+              </div>
+            </div>
+          </WhoRow>
+        ))}
+      </TableWrap>
+    </section>
+  );
+}
+
+
+/* ---------- BR-027, from the teacher's side ----------
+
+   The same two keys the school and the firm see, so a teacher can tell which
+   half of the decision is outstanding rather than just "pending". */
+
+function MyRequests() {
+  const actor = useActor();
+  const { data, awaiting } = useData();
+
+  const mine = data.assignments.filter(
+    (a) => a.teacherId === actor.teacherId && a.status === 'requested');
+  if (!mine.length) return null;
+
+  return (
+    <section className="mb-6">
+      <SectionHead title="Your requests to teach" icon={Clock}
+        right={`${mine.length} awaiting a decision`} />
+      <TableWrap minWidth={720} head={['School', 'Covers', 'Requested', 'Approvals']}>
+        {mine.map((a) => {
+          const school = data.schools.find((s) => s.id === a.schoolId);
+          return (
+            <tr key={a.id}>
+              <td className="font-semibold">{school?.name ?? a.schoolId}</td>
+              <td className="text-sm text-[var(--text-2)]">
+                {a.subjects.join(', ') || 'Any subject'} · {a.classes.join(', ') || 'any class'}
+              </td>
+              <td className="text-sm text-[var(--text-2)]">
+                {a.createdAt ? dateShort(a.createdAt.slice(0, 10)) : '—'}
+              </td>
+              <td>
+                <ApprovalPair school={a.schoolApprovedAt} admin={a.adminApprovedAt} />
+                <div className="text-xs text-[var(--text-3)] mt-1">{awaiting(a)}</div>
+              </td>
+            </tr>
+          );
+        })}
+      </TableWrap>
+    </section>
   );
 }

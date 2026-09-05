@@ -9,6 +9,8 @@ import {
   canTransition, detectFlags, durationOf, periodsOf, validateSession, visibleSessions,
   DEFAULT_SETTINGS
 } from '../lib/rules';
+import { adminSigned, awaitingFrom, fullySigned, schoolSigned } from '../lib/rules';
+import { COLLECTION_KEYS, planFor, type RepoScope } from '../lib/repo';
 import type { AdminAccount, Assignment, TeachingSession, UserProfile } from '../lib/types';
 
 const today = '2026-08-25';
@@ -127,6 +129,101 @@ ok('BR-024 the founder cannot be frozen by anyone',
    canAdminAct(sibling, founder, 'suspend') === false);
 ok('BR-024 the founder cannot be deactivated by anyone',
    canAdminAct(sibling, founder, 'deactivate') === false);
+
+
+/* ---------- the repository asks only for what the rules will answer ----------
+
+   Every read rule but the admin's names a field of the document, and a
+   Firestore list is refused whole if a single document it would return fails
+   that rule. So the query the repository issues has to be narrow enough that
+   everything it can return already satisfies the clause. These assertions hold
+   each plan against the clause in firestore.rules it stands in for: if a rule
+   is tightened and the plan is not, the query starts being refused silently
+   and a teacher or a school is shown an empty platform. */
+
+const TEACHER: RepoScope = { role: 'teacher', teacherId: 'TCH-1', schoolId: null };
+const SCHOOL: RepoScope = { role: 'school', teacherId: null, schoolId: 'SCH-1' };
+const ADMIN: RepoScope = { role: 'admin' };
+const UNLINKED: RepoScope = { role: 'teacher', teacherId: null, schoolId: null };
+
+const plan = (k: Parameters<typeof planFor>[0], s: RepoScope, want: unknown) =>
+  JSON.stringify(planFor(k, s)) === JSON.stringify(want);
+
+// isAdmin() looks at no field of the document, so an admin alone can list.
+ok('an admin can list every collection unfiltered',
+   COLLECTION_KEYS.every((k) => planFor(k, ADMIN) === 'all'));
+
+// BR-011 and BR-027, as queries: the two-sided records, filtered to your side.
+ok('a teacher reads only their own assignments',
+   plan('assignments', TEACHER, { field: 'teacherId', value: 'TCH-1' }));
+ok('a school reads only the assignments at its school',
+   plan('assignments', SCHOOL, { field: 'schoolId', value: 'SCH-1' }));
+ok('a teacher reads only their own sessions',
+   plan('sessions', TEACHER, { field: 'teacherId', value: 'TCH-1' }));
+ok('a school reads only the sessions at its school',
+   plan('sessions', SCHOOL, { field: 'schoolId', value: 'SCH-1' }));
+
+// The two directory rules, each the mirror of the other.
+ok('a teacher may list every school, to have one to request',
+   planFor('schools', TEACHER) === 'all');
+ok('a school reads only its own record', plan('schools', SCHOOL, { docId: 'SCH-1' }));
+ok('a school may list the teachers in its building',
+   planFor('teachers', SCHOOL) === 'all');
+ok('a teacher reads only their own record', plan('teachers', TEACHER, { docId: 'TCH-1' }));
+
+// Addressed post, and owned files.
+ok('a teacher reads only post addressed to them',
+   plan('notifications', TEACHER, { field: 'audienceId', value: 'TCH-1' }));
+ok('a school reads only its own documents',
+   plan('documents', SCHOOL, { field: 'ownerId', value: 'SCH-1' }));
+
+// Admin-only collections are not asked for rather than asked for and refused.
+ok('a teacher does not ask for the administrator list',
+   planFor('admins', TEACHER) === 'none');
+ok('a school does not ask for the audit trail',
+   planFor('auditLogs', SCHOOL) === 'none');
+
+// Reference data is organisation-wide, and readable by everyone in it.
+ok('subjects are readable across the organisation',
+   planFor('subjects', TEACHER) === 'all' && planFor('subjects', SCHOOL) === 'all');
+ok('classes are readable across the organisation',
+   planFor('classes', TEACHER) === 'all' && planFor('classes', SCHOOL) === 'all');
+
+/* An approved account whose profile has not been linked to its record yet must
+   ask for nothing rather than ask for everything: an unfiltered query is
+   refused, and a refusal is indistinguishable from an empty platform. */
+ok('an unlinked teacher asks for no assignments',
+   planFor('assignments', UNLINKED) === 'none');
+ok('an unlinked teacher can still see the schools',
+   planFor('schools', UNLINKED) === 'all');
+
+
+/* ---------- BR-027: two keys, and a request that says which one is missing ----
+
+   A request to teach is granted by the school and by the firm, and by neither
+   alone. Until both have turned their key the request is still pending - and
+   "pending" on its own is not an answer, so the state names the half that has
+   already signed and the half still being waited on. */
+
+const unsigned = {};
+const bySchool = { schoolApprovedAt: '2026-09-05T09:00:00.000Z' };
+const byAdmin = { adminApprovedAt: '2026-09-05T09:00:00.000Z' };
+const byBoth = { ...bySchool, ...byAdmin };
+
+ok('BR-027 neither key alone completes the request',
+   !fullySigned(bySchool) && !fullySigned(byAdmin));
+ok('BR-027 both keys together complete it', fullySigned(byBoth));
+ok('BR-027 each side is read independently',
+   schoolSigned(bySchool) && !adminSigned(bySchool)
+   && adminSigned(byAdmin) && !schoolSigned(byAdmin));
+
+ok('a fresh request is waiting on both',
+   awaitingFrom(unsigned) === 'Waiting on the school and Glampter');
+ok('when the school has signed, the state says so and names Glampter',
+   awaitingFrom(bySchool) === 'The school has approved - waiting on Glampter');
+ok('when Glampter has signed, the state says so and names the school',
+   awaitingFrom(byAdmin) === 'Glampter has approved - waiting on the school');
+ok('a complete request is waiting on nobody', awaitingFrom(byBoth) === '');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

@@ -17,12 +17,18 @@
 import {
   createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode
 } from 'react';
-import { emptyCollections, makeRepo, nextId, type Collections, type Repo } from './repo';
+import { emptyCollections, makeRepo, newId, nextId, type Collections, type Repo } from './repo';
 import {
-  DEFAULT_SETTINGS, adminActionIssue, canManageAdmins, canReview, canTransition,
-  detectFlags, durationOf, periodsOf, validateSession, visibleSessions,
+  ensureFounder, firebaseReady, reRequestApproval, requestAccountDeletion,
+  resolveAccountDeletion, saveOwnProfile, watchUsers, writeAdminGrade
+} from './firebase';
+import {
+  DEFAULT_SETTINGS, adminActionIssue, approvalSide, awaitingFrom, canManageAdmins,
+  canReview, canTransition, detectFlags, durationOf, fullySigned, periodsOf,
+  validateSession, visibleSessions,
   type AdminAction, type Issue, type SessionDraft
 } from './rules';
+import { isPending, needsTeacherAction } from './compute';
 import { nowISO, todayISO } from './format';
 import { useGlam } from './store';
 import type {
@@ -51,6 +57,33 @@ type Ctx = {
   resubmitSession(id: string, draft: SessionDraft, note: string): Promise<{ ok: boolean; issues: Issue[] }>;
   cancelSession(id: string, reason: string): Promise<boolean>;
 
+  /** Everything waiting on this account, whatever kind of account it is. */
+  pendingItems: PendingItem[];
+  /** Every identity document the firm can see. Empty in preview. */
+  liveUsers: UserProfile[];
+  /** Teachers and schools waiting for the firm to activate them. */
+  pendingSignups: UserProfile[];
+  /** Accounts whose holder has asked to close them. Super admins decide. */
+  deleteRequests: UserProfile[];
+  /** Edit your own record. Email, role, status and grade are not yours to set. */
+  saveMyProfile(patch: Partial<UserProfile>): Promise<boolean>;
+  /** Ask for your own account to be closed. */
+  askToCloseMyAccount(reason: string): Promise<boolean>;
+  /** A refused account asking to be reconsidered. */
+  askForApprovalAgain(): Promise<boolean>;
+  /** Sign this account's side of an assignment. BR-027 needs both. */
+  signAssignment(id: string, approve: boolean, reason?: string): Promise<boolean>;
+  reviseMyAssignment(id: string, subjects: string[], classes: string[]): Promise<boolean>;
+  withdrawFromSchool(id: string, reason?: string): Promise<boolean>;
+  /** What is still outstanding on a record, phrased for a person. */
+  awaiting(r: { schoolApprovedAt?: string; adminApprovedAt?: string }): string;
+  /** A super admin's answer to that request. */
+  decideDeletion(uid: string, approve: boolean): Promise<boolean>;
+  /** Activate or refuse a teacher or school registration. */
+  decideRegistration(uid: string, approve: boolean): Promise<boolean>;
+  /** Every administrator the module should list: the live roster when signed
+      in, the demo fixture in preview. */
+  adminRoster: AdminAccount[];
   /** The AdminAccount behind the signed-in administrator, if there is one. */
   myAdmin: AdminAccount | null;
   /** True only for an active super admin — gates the Admin Manager module. */
@@ -79,6 +112,15 @@ type Ctx = {
   resetDemoData(): void;
 };
 
+/** One thing waiting on the signed-in account, whoever they are. Derived live
+    rather than stored, so the bell can never disagree with the modules. */
+export type PendingItem = {
+  id: string;
+  title: string;
+  detail: string;
+  href: string;
+};
+
 const DataCtx = createContext<Ctx | null>(null);
 
 export const useData = () => {
@@ -86,6 +128,37 @@ export const useData = () => {
   if (!c) throw new Error('useData must be used inside <DataProvider>');
   return c;
 };
+
+/** An administrator's identity document seen as a roster row. One record, two
+    shapes: users/{uid} is what Firestore stores and what the rules read;
+    AdminAccount is what lib/rules.ts and the module work in. */
+export function adminFromProfile(p: UserProfile): AdminAccount {
+  return {
+    id: p.adminId ?? p.uid,
+    uid: p.uid,
+    name: p.displayName || p.email,
+    firstName: p.firstName,
+    surname: p.surname,
+    email: p.email,
+    phone: p.phone,
+    level: p.adminLevel ?? 'standard',
+    status: p.status,
+    promotedBy: p.promotedBy,
+    founder: p.founder,
+    createdAt: p.createdAt,
+    updatedAt: p.updatedAt
+  };
+}
+
+/** "Mrs. Folake Adeyemi" → "Folake". A title is not a name, and the demo
+    contacts carry them. */
+const TITLES = new Set(['mr', 'mrs', 'ms', 'miss', 'dr', 'prof', 'engr']);
+
+function firstNameOf(full?: string): string {
+  const parts = (full ?? '').trim().split(/\s+/).filter(Boolean);
+  const head = (parts[0] ?? '').replace(/\.$/, '').toLowerCase();
+  return (TITLES.has(head) ? parts[1] : parts[0]) ?? '';
+}
 
 /** The identity used for writes. In preview there is no account, so the
     switcher's role stands in — every write still records who did it. */
@@ -102,12 +175,20 @@ function actorOf(profile: UserProfile | null, role: UserProfile['role'], data: C
     schoolId: role === 'school' ? school?.id : undefined,
     displayName: role === 'teacher' ? (teacher?.name ?? 'Teacher')
       : role === 'school' ? (school?.name ?? 'School') : 'Glampter Operations',
+    /* Name parts too, so anything that greets a person by name behaves the same
+       in preview as it does for a real account — a school registers under the
+       school's name, and the person behind it is its contact. */
+    ...(role === 'teacher'
+      ? { firstName: firstNameOf(teacher?.name) }
+      : role === 'school'
+        ? { contactFirstName: firstNameOf(school?.contact) }
+        : { firstName: 'Glampter' }),
     email: '', phone: '', createdAt: nowISO()
   };
 }
 
 export function DataProvider({ children }: { children: ReactNode }) {
-  const { profile, role, stage, preview, say } = useGlam();
+  const { profile, role, stage, preview, refresh, say } = useGlam();
   const [repo, setRepo] = useState<Repo | null>(null);
   const [data, setData] = useState<Collections>(EMPTY);
   const [ready, setReady] = useState(false);
@@ -116,12 +197,24 @@ export function DataProvider({ children }: { children: ReactNode }) {
      repository, so the whole product is operable in preview. */
   useEffect(() => {
     if (stage === 'loading') return;
-    const r = makeRepo(stage === 'ready');
+    /* The demo fixture exists so an unauthenticated PREVIEW is reviewable — it
+       is not something a real account should ever be offered. Anyone holding a
+       profile reads the organisation's own records, whatever their status, so a
+       pending teacher is shown the firm's real schools and subjects (usually
+       none yet) rather than five fictional schools they could request. */
+    /* The scope decides which query each collection gets: the rules refuse an
+       unfiltered list to anyone but an admin, so a teacher and a school have to
+       ask narrowly to be answered at all. */
+    const r = makeRepo(Boolean(profile), {
+      role: profile?.role ?? null,
+      teacherId: profile?.teacherId ?? null,
+      schoolId: profile?.schoolId ?? null
+    });
     setRepo(r);
     const unsub = r.subscribe((c) => { setData(c); setReady(true); });
     void r.load().then((c) => { setData(c); setReady(true); });
     return unsub;
-  }, [stage]);
+  }, [stage, profile]);
 
   const today = data.settings ? todayISO(data.settings.timezone) : todayISO();
   const actor = useMemo(() => actorOf(profile, role, data), [profile, role, data]);
@@ -134,7 +227,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     if (!repo) return;
     await repo.put('auditLogs', {
       ...entry,
-      id: nextId('AUD', data.auditLogs),
+      id: newId('AUD'),
       at: nowISO(),
       actor: actor.displayName,
       actorRole: actor.role
@@ -145,14 +238,13 @@ export function DataProvider({ children }: { children: ReactNode }) {
     items: Omit<Notification, 'id' | 'read' | 'createdAt'>[]
   ) => {
     if (!repo || !items.length) return;
-    const base = data.notifications;
-    await repo.putMany('notifications', items.map((n, i) => ({
+    await repo.putMany('notifications', items.map((n) => ({
       ...n,
-      id: nextId('NTF', [...base, ...Array.from({ length: i }, (_, k) => ({ id: `NTF-${k}` }))]),
+      id: newId('NTF'),
       read: false,
       createdAt: nowISO()
     })));
-  }, [repo, data.notifications]);
+  }, [repo]);
 
   /* ---------- sessions ---------- */
 
@@ -165,7 +257,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const school = data.schools.find((s) => s.id === draft.schoolId);
     const existing = opts.id ? data.sessions.find((s) => s.id === opts.id) : undefined;
     const minutes = durationOf(draft.startTime, draft.endTime);
-    const id = opts.id ?? nextId('TS', data.sessions);
+    const id = opts.id ?? newId('TS');
     const submit = opts.submit ?? true;
 
     const record: TeachingSession = {
@@ -350,13 +442,50 @@ export function DataProvider({ children }: { children: ReactNode }) {
      Every write re-checks the same rule the button used to decide whether to
      render itself, so a stale page or a hand-crafted call cannot get past it. */
 
+  /* Live administrators, straight from users/{uid}. Registration writes that
+     document and firestore.rules grades people by it, so it is the only honest
+     source for a real account — the org's `admins` collection is a preview
+     fixture and was never synchronised with it. */
+  const [liveUsers, setLiveUsers] = useState<UserProfile[]>([]);
+
+  useEffect(() => {
+    if (stage !== 'ready' || role !== 'admin' || !firebaseReady) { setLiveUsers([]); return; }
+    return watchUsers(setLiveUsers);
+  }, [stage, role]);
+
+  const liveAdmins = useMemo(
+    () => liveUsers.filter((u) => u.role === 'admin'), [liveUsers]);
+
+  const pendingSignups = useMemo(
+    () => liveUsers
+      .filter((u) => u.status === 'pending' && !u.deletedAt)
+      .sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? '')),
+    [liveUsers]);
+
+  const deleteRequests = useMemo(
+    () => liveUsers.filter((u) => !!u.deleteRequestedAt && !u.deletedAt), [liveUsers]);
+
+  /* The first administrator settles the founder slot on sign-in, because the
+     attempt made during registration can legitimately have failed — rules not
+     yet deployed, or a lost race. Without this a platform can end up with no
+     super admin and no way to appoint one. */
+  useEffect(() => {
+    if (stage !== 'ready' || !profile || profile.role !== 'admin' || !firebaseReady) return;
+    void ensureFounder(profile);
+  }, [stage, profile]);
+
+  const adminRoster = useMemo<AdminAccount[]>(
+    () => (liveAdmins.length ? liveAdmins.map(adminFromProfile) : data.admins),
+    [liveAdmins, data.admins]);
+
   const myAdmin = useMemo<AdminAccount | null>(() => {
     if (role !== 'admin') return null;
-    const linked = profile?.uid ? data.admins.find((a) => a.uid === profile.uid) : undefined;
-    if (linked) return linked;
+    /* A signed-in administrator is graded by their own profile. The roster row
+       may not exist — nothing ever created one — and requiring it is what made
+       the module invisible to the very account that owns it. */
+    if (profile && profile.role === 'admin') return adminFromProfile(profile);
     /* Preview has no account at all, so it stands in as the founder — that is
-       what makes the module reviewable before anyone has registered. A real
-       signed-in admin with no linked record deliberately gets nothing. */
+       what makes the module reviewable before anyone has registered. */
     return preview ? (data.admins.find((a) => a.founder) ?? null) : null;
   }, [role, profile, preview, data.admins]);
 
@@ -367,7 +496,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
   const setAdminStatus: Ctx['setAdminStatus'] = useCallback(async (id, status, reason) => {
     if (!repo) return false;
-    const target = data.admins.find((a) => a.id === id);
+    const target = adminRoster.find((a) => a.id === id);
     if (!target) return false;
 
     const action: AdminAction =
@@ -377,10 +506,13 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const issue = adminActionIssue(myAdmin, target, action);
     if (issue) { say(issue); return false; }
 
-    const next: AdminAccount = {
-      ...target, status, updatedAt: nowISO(), ...(reason ? { notes: reason } : {})
-    };
-    await repo.put('admins', next);
+    if (target.uid) {
+      await writeAdminGrade(target.uid, { status });
+    } else {
+      await repo.put('admins', {
+        ...target, status, updatedAt: nowISO(), ...(reason ? { notes: reason } : {})
+      });
+    }
     await writeAudit({
       action: `admin.${action}`, objectType: 'admin', objectId: id,
       summary: `${target.name} ${action === 'approve' ? 'approved as administrator'
@@ -392,11 +524,11 @@ export function DataProvider({ children }: { children: ReactNode }) {
     say(`${target.name} ${status === 'active' ? 'is now active'
       : status === 'suspended' ? 'is frozen' : 'is deactivated'}.`);
     return true;
-  }, [repo, data.admins, myAdmin, writeAudit, say]);
+  }, [repo, adminRoster, myAdmin, writeAudit, say]);
 
   const promoteAdmin: Ctx['promoteAdmin'] = useCallback(async (id) => {
     if (!repo) return false;
-    const target = data.admins.find((a) => a.id === id);
+    const target = adminRoster.find((a) => a.id === id);
     if (!target || !myAdmin) return false;
 
     const issue = adminActionIssue(myAdmin, target, 'promote');
@@ -404,9 +536,13 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
     /* promotedBy is the whole of BR-023: it is what later stops this account
        from freezing the person who granted it. */
-    await repo.put('admins', {
-      ...target, level: 'super', promotedBy: myAdmin.id, updatedAt: nowISO()
-    });
+    if (target.uid) {
+      await writeAdminGrade(target.uid, { adminLevel: 'super', promotedBy: myAdmin.id });
+    } else {
+      await repo.put('admins', {
+        ...target, level: 'super', promotedBy: myAdmin.id, updatedAt: nowISO()
+      });
+    }
     await writeAudit({
       action: 'admin.promote', objectType: 'admin', objectId: id,
       summary: `${target.name} promoted to super admin by ${myAdmin.name}`,
@@ -414,7 +550,187 @@ export function DataProvider({ children }: { children: ReactNode }) {
     });
     say(`${target.name} is now a super admin.`);
     return true;
-  }, [repo, data.admins, myAdmin, writeAudit, say]);
+  }, [repo, adminRoster, myAdmin, writeAudit, say]);
+
+  /* ---------- binding an account to its organisation record ----------
+
+     The rules match a teacher to their own work through me().teacherId, so an
+     account without that link can read but never write — which is exactly what
+     made "request to teach in a school" fail.
+
+     It has to be repaired from the administrator's session, not the account's
+     own. A teacher may only read teachers/{id} where me().teacherId == id, so
+     an account with no link can see nothing in that collection and cannot find
+     the very record that would supply it. An administrator can read every
+     account and write both halves, so this is the only session where the
+     repair is possible at all.
+
+     Two things are fixed here, in order: the org record an account approved
+     before records existed never got, and the profile link an account approved
+     before the link existed never got. Both are idempotent. */
+
+  useEffect(() => {
+    if (stage !== 'ready' || role !== 'admin' || !repo || !ready || !firebaseReady) return;
+
+    for (const u of liveUsers) {
+      if (u.status !== 'active' || u.deletedAt) continue;
+
+      if (u.role === 'teacher') {
+        const rec = data.teachers.find((t) => t.uid === u.uid);
+        if (!rec) {
+          void repo.put('teachers', {
+            id: nextId('TCH', data.teachers), uid: u.uid, name: u.displayName || u.email,
+            email: u.email, phone: u.phone, subjects: [], qualification: '',
+            experienceYears: 0, hourlyRate: 0, joined: nowISO().slice(0, 10), status: 'active'
+          });
+        } else if (u.teacherId !== rec.id) {
+          void writeAdminGrade(u.uid, { teacherId: rec.id });
+        }
+      }
+
+      if (u.role === 'school') {
+        const rec = data.schools.find((s) => s.uid === u.uid);
+        if (!rec) {
+          void repo.put('schools', {
+            id: nextId('SCH', data.schools), uid: u.uid, name: u.displayName || u.email,
+            shortName: u.displayName || u.email, address: '', city: '',
+            contact: [u.contactFirstName, u.contactSurname].filter(Boolean).join(' '),
+            email: u.email, phone: u.phone, hourlyRate: 0, contractedHours: 0,
+            openTime: '07:30', closeTime: '16:00', status: 'active'
+          });
+        } else if (u.schoolId !== rec.id) {
+          void writeAdminGrade(u.uid, { schoolId: rec.id });
+        }
+      }
+    }
+  }, [stage, role, repo, ready, liveUsers, data.teachers, data.schools]);
+
+  const saveMyProfile: Ctx['saveMyProfile'] = useCallback(async (patch) => {
+    if (!profile?.uid) return false;
+    await saveOwnProfile(profile.uid, patch);
+    say('Profile saved.');
+    return true;
+  }, [profile, say]);
+
+  const askToCloseMyAccount: Ctx['askToCloseMyAccount'] = useCallback(async (reason) => {
+    if (!profile?.uid) return false;
+    await requestAccountDeletion(profile.uid, reason);
+    /* Every super admin is told, because any of them can answer it. */
+    await notify([{
+      kind: 'account-delete-requested',
+      title: 'Account closure requested',
+      body: `${profile.displayName} asked for their ${profile.role} account to be closed — ${reason}`,
+      audienceRole: 'admin',
+      href: '/admin-manager'
+    }]);
+    await writeAudit({
+      action: 'account.delete-requested', objectType: 'account', objectId: profile.uid,
+      summary: `${profile.displayName} asked to close their account — ${reason}`
+    });
+    say('Request sent. A super admin will review it.');
+    return true;
+  }, [profile, notify, writeAudit, say]);
+
+  const askForApprovalAgain: Ctx['askForApprovalAgain'] = useCallback(async () => {
+    if (!profile?.uid) return false;
+    try {
+      await reRequestApproval(profile.uid);
+    } catch {
+      say('That did not send. Check your connection and try again.');
+      return false;
+    }
+    /* Deliberately no notification write. A refused account is not `active`,
+       and firestore.rules only lets an active member of the org create one —
+       so that write was rejected and surfaced as an error overlay even though
+       the request itself had already gone through. The firm sees the account
+       in its registration queue anyway, because that queue is derived from
+       users/{uid}.status, which is precisely what just changed. */
+    await refresh();   // re-read the profile so the banner flips without a reload
+    say('Sent. The firm will look at your account again.');
+    return true;
+  }, [profile, refresh, say]);
+
+  const decideDeletion: Ctx['decideDeletion'] = useCallback(async (uid, approve) => {
+    if (!isSuperAdmin) { say('Only a super admin can decide an account closure.'); return false; }
+    const target = liveUsers.find((u) => u.uid === uid);
+    await resolveAccountDeletion(uid, approve);
+    await writeAudit({
+      action: approve ? 'account.delete-approved' : 'account.delete-declined',
+      objectType: 'account', objectId: uid,
+      summary: `${target?.displayName ?? uid} closure ${approve ? 'approved' : 'declined'}`
+    });
+    say(approve ? 'Account closed.' : 'Closure declined.');
+    return true;
+  }, [isSuperAdmin, liveUsers, writeAudit, say]);
+
+  const decideRegistration: Ctx['decideRegistration'] = useCallback(async (uid, approve) => {
+    if (role !== 'admin') return false;
+    const target = liveUsers.find((u) => u.uid === uid);
+    if (!target) return false;
+
+    /* Only a super admin decides another administrator. */
+    if (target.role === 'admin' && !isSuperAdmin) {
+      say('Approval from a super admin is needed for an administrator account.');
+      return false;
+    }
+
+    /* Approving is also what binds the account to its organisation record. The
+       rules match a teacher to their own work through me().teacherId, so
+       without this link an approved teacher cannot create anything — which is
+       exactly why requesting a school came back as a permission error. */
+    let teacherId = data.teachers.find((x) => x.uid === uid)?.id;
+    let schoolId = data.schools.find((x) => x.uid === uid)?.id;
+
+    if (approve && repo) {
+      if (target.role === 'school' && !schoolId) {
+        schoolId = nextId('SCH', data.schools);
+        await repo.put('schools', {
+          id: schoolId,
+          uid,
+          name: target.displayName,
+          shortName: target.displayName,
+          address: '', city: '',
+          contact: [target.contactFirstName, target.contactSurname].filter(Boolean).join(' '),
+          email: target.email,
+          phone: target.phone,
+          hourlyRate: 0,
+          contractedHours: 0,
+          openTime: '07:30', closeTime: '16:00',
+          status: 'active'
+        });
+      }
+      if (target.role === 'teacher' && !teacherId) {
+        teacherId = nextId('TCH', data.teachers);
+        await repo.put('teachers', {
+          id: teacherId,
+          uid,
+          name: target.displayName,
+          email: target.email,
+          phone: target.phone,
+          subjects: [],
+          qualification: '',
+          experienceYears: 0,
+          hourlyRate: 0,
+          joined: nowISO().slice(0, 10),
+          status: 'active'
+        });
+      }
+    }
+
+    await writeAdminGrade(uid, {
+      status: approve ? 'active' : 'rejected',
+      ...(approve && teacherId ? { teacherId } : {}),
+      ...(approve && schoolId ? { schoolId } : {})
+    });
+
+    await writeAudit({
+      action: approve ? 'account.approved' : 'account.rejected',
+      objectType: 'account', objectId: uid,
+      summary: `${target.displayName || uid} (${target.role}) ${approve ? 'activated' : 'rejected'}`
+    });
+    say(approve ? 'Registration approved.' : 'Registration rejected.');
+    return true;
+  }, [role, isSuperAdmin, liveUsers, repo, data.schools, data.teachers, writeAudit, say]);
 
   const setAccountStatus: Ctx['setAccountStatus'] = useCallback(async (kind, id, status, reason) => {
     if (!repo) return;
@@ -439,37 +755,258 @@ export function DataProvider({ children }: { children: ReactNode }) {
 
   const saveAssignment: Ctx['saveAssignment'] = useCallback(async (a) => {
     if (!repo) return '';
-    const id = a.id ?? nextId('ASN', data.assignments);
+    const id = a.id ?? newId('ASN');
     const existing = data.assignments.find((x) => x.id === id);
     const rec: Assignment = {
       teacherId: '', schoolId: '', subjects: [], classes: [], startDate: today,
       assignedBy: actor.displayName, origin: 'admin', status: 'active', createdAt: nowISO(),
       ...existing, ...a, id
     };
-    await repo.put('assignments', rec);
+
+    /* The record is the request. If this fails there is nothing to report on,
+       so it is the only failure the person needs to hear about. */
+    try {
+      await repo.put('assignments', rec);
+    } catch {
+      say('That request could not be sent. Check your connection and try again.');
+      return '';
+    }
+
     const teacher = data.teachers.find((t) => t.id === rec.teacherId);
     const school = data.schools.find((s) => s.id === rec.schoolId);
-    await writeAudit({
-      action: existing ? 'assignment.update' : 'assignment.create',
-      objectType: 'assignment', objectId: id,
-      summary: `${teacher?.name ?? rec.teacherId} → ${school?.name ?? rec.schoolId} (${rec.subjects.join(', ') || 'all subjects'})`
-    });
-    if (!existing && rec.status === 'active') {
-      await notify([{
-        kind: 'assignment-created', title: 'You have a new school assignment',
-        body: `You are assigned to ${school?.name ?? 'a school'} from ${rec.startDate}.`,
-        audienceRole: 'teacher', audienceId: rec.teacherId, href: '/my-schools'
-      }]);
-    }
-    if (!existing && rec.status === 'requested') {
-      await notify([{
-        kind: 'assignment-requested', title: 'Assignment request',
-        body: `${teacher?.name ?? 'A teacher'} asked to teach at ${school?.name ?? 'a school'}.`,
-        audienceRole: 'admin', href: '/assignments'
-      }]);
-    }
+
+    /* Everything below is best-effort. The request already exists; a trail or a
+       notification that cannot be written must not surface as a failed request
+       — an unhandled rejection here is what put an error on screen after a
+       submission that had actually succeeded. */
+    try {
+      await writeAudit({
+        action: existing ? 'assignment.update' : 'assignment.create',
+        objectType: 'assignment', objectId: id,
+        summary: `${teacher?.name ?? rec.teacherId} → ${school?.name ?? rec.schoolId} (${rec.subjects.join(', ') || 'all subjects'})`
+      });
+    } catch { /* the record stands without its audit line */ }
+
+    try {
+      if (!existing && rec.status === 'active') {
+        await notify([{
+          kind: 'assignment-created', title: 'You have a new school assignment',
+          body: `You are assigned to ${school?.name ?? 'a school'} from ${rec.startDate}.`,
+          audienceRole: 'teacher', audienceId: rec.teacherId, href: '/my-schools'
+        }]);
+      }
+      if (!existing && rec.status === 'requested') {
+        /* Both signatories, because BR-027 needs both of them to act, and the
+           teacher so they can see it is with the right people. */
+        await notify([
+          {
+            kind: 'assignment-requested', title: 'Request to teach',
+            body: `${teacher?.name ?? 'A teacher'} asked to teach at ${school?.name ?? 'your school'}.`,
+            audienceRole: 'school', audienceId: rec.schoolId, href: '/dashboard'
+          },
+          {
+            kind: 'assignment-requested', title: 'Request to teach',
+            body: `${teacher?.name ?? 'A teacher'} asked to teach at ${school?.name ?? 'a school'}.`,
+            audienceRole: 'admin', href: '/dashboard'
+          },
+          {
+            kind: 'assignment-requested', title: 'Request sent',
+            body: `Waiting on ${school?.name ?? 'the school'} and Glampter to approve.`,
+            audienceRole: 'teacher', audienceId: rec.teacherId, href: '/my-schools'
+          }
+        ]);
+      }
+    } catch { /* the request stands without its notifications */ }
+
     return id;
-  }, [repo, data.assignments, data.teachers, data.schools, today, actor, writeAudit, notify]);
+  }, [repo, data.assignments, data.teachers, data.schools, today, actor, writeAudit, notify, say]);
+
+  /* ---------- BR-027: an assignment needs both keys ----------
+
+     The account signs its own side and nothing else. The record only becomes
+     active once the other side is already in, so neither the school nor the
+     firm can place a teacher on its own. */
+
+  const signAssignment: Ctx['signAssignment'] = useCallback(async (id, approve, reason) => {
+    if (!repo) return false;
+    const a = data.assignments.find((x) => x.id === id);
+    if (!a) return false;
+
+    const side = approvalSide(actor.role);
+    if (!side) { say('Only a school or an administrator can decide this.'); return false; }
+
+    /* An account still waiting on its own approval cannot approve anyone. */
+    if (actor.status !== 'active') {
+      say('Approval from a super admin is needed before you can decide requests.');
+      return false;
+    }
+    if (side === 'school' && a.schoolId !== actor.schoolId) {
+      say('That request belongs to another school.');
+      return false;
+    }
+
+    if (!approve) {
+      try {
+        await repo.put('assignments', { ...a, status: 'rejected', notes: reason ?? a.notes });
+      } catch {
+        say('That decision could not be saved. Check your connection and try again.');
+        return false;
+      }
+      /* Best-effort from here: the rejection is already recorded, and a trail
+         that will not write must never present itself as a decision that did
+         not happen. */
+      try {
+        await writeAudit({
+          action: 'assignment.rejected', objectType: 'assignment', objectId: id,
+          summary: 'Assignment ' + id + ' rejected by the ' + side + (reason ? ' - ' + reason : ''),
+          before: a.status, after: 'rejected'
+        });
+      } catch { /* the rejection stands without its audit line */ }
+      try {
+        await notify([{
+          kind: 'assignment-created', title: 'Your request was rejected',
+          body: reason || 'The ' + side + ' rejected your request to teach.',
+          audienceRole: 'teacher', audienceId: a.teacherId, href: '/my-schools'
+        }]);
+      } catch { /* the rejection stands without its notification */ }
+      say('Request rejected.');
+      return true;
+    }
+
+    const stamped = {
+      ...a,
+      ...(side === 'school'
+        ? { schoolApprovedAt: nowISO(), schoolApprovedBy: actor.displayName }
+        : { adminApprovedAt: nowISO(), adminApprovedBy: actor.displayName })
+    };
+    const done = fullySigned(stamped);
+
+    /* The stamp is the decision. If it will not save there is nothing to
+       announce, and that is the only failure worth interrupting someone for -
+       everything after it is a trail, and a trail that cannot be written must
+       never present itself as a decision that did not happen. */
+    try {
+      await repo.put('assignments', { ...stamped, status: done ? 'active' : 'requested' });
+    } catch {
+      say('That decision could not be saved. Check your connection and try again.');
+      return false;
+    }
+
+    try {
+      await writeAudit({
+        action: 'assignment.' + side + '-approved', objectType: 'assignment', objectId: id,
+        summary: 'Assignment ' + id + ' approved by the ' + side
+                 + (done ? ' - now active' : ' - ' + awaitingFrom(stamped)),
+        before: a.status, after: done ? 'active' : 'requested'
+      });
+    } catch { /* the decision stands without its audit line */ }
+
+    /* Everyone who is still needed, and the teacher either way. */
+    const audiences: Notification['audienceRole'][] = done ? ['teacher'] : ['teacher', side === 'school' ? 'admin' : 'school'];
+    try {
+      await notify(audiences.map((audienceRole) => ({
+        kind: 'assignment-created' as const,
+        title: done ? 'Assignment approved' : 'One approval in, one to go',
+        body: done
+          ? 'The school and Glampter have both approved the placement.'
+          : awaitingFrom(stamped) + ' on this request to teach.',
+        audienceRole,
+        audienceId: audienceRole === 'teacher' ? a.teacherId : undefined,
+        href: audienceRole === 'teacher' ? '/my-schools' : '/assignments'
+      })));
+    } catch { /* the decision stands without its notifications */ }
+
+    say(done ? 'Approved. The placement is now active.' : 'Approved. ' + awaitingFrom(stamped) + '.');
+    return true;
+  }, [repo, data.assignments, actor, writeAudit, notify, say]);
+
+  /* Revising what you cover is a change to what was agreed, so it goes back
+     through both keys rather than quietly widening itself. */
+  const reviseMyAssignment: Ctx['reviseMyAssignment'] = useCallback(async (id, subjects, classes) => {
+    if (!repo) return false;
+    const a = data.assignments.find((x) => x.id === id);
+    if (!a || a.teacherId !== actor.teacherId) return false;
+
+    try {
+      await repo.put('assignments', {
+        ...a, subjects, classes, status: 'requested',
+        /* Emptied rather than removed: the repository strips undefined before
+           it writes, so '' is how a stamp is actually taken back off. */
+        schoolApprovedAt: '', schoolApprovedBy: '', adminApprovedAt: '', adminApprovedBy: ''
+      });
+    } catch {
+      say('That change could not be saved. Check your connection and try again.');
+      return false;
+    }
+
+    const school = data.schools.find((s) => s.id === a.schoolId);
+    try {
+      await writeAudit({
+        action: 'assignment.revised', objectType: 'assignment', objectId: id,
+        summary: 'Coverage revised at ' + (school?.name ?? a.schoolId)
+                 + ' - ' + (subjects.join(', ') || 'any subject'),
+        before: a.status, after: 'requested'
+      });
+    } catch { /* the change stands without its audit line */ }
+    try {
+      await notify(['school', 'admin'].map((audienceRole) => ({
+        kind: 'assignment-requested' as const,
+        title: 'Revised request to teach',
+        body: (data.teachers.find((t) => t.id === a.teacherId)?.name ?? 'A teacher')
+              + ' changed what they cover at ' + (school?.name ?? 'a school') + '.',
+        audienceRole: audienceRole as Notification['audienceRole'],
+        audienceId: audienceRole === 'school' ? a.schoolId : undefined,
+        href: '/dashboard'
+      })));
+    } catch { /* the change stands without its notifications */ }
+
+    say('Sent. The school and Glampter both approve the new subjects and classes.');
+    return true;
+  }, [repo, data.assignments, data.schools, data.teachers, actor, writeAudit, notify, say]);
+
+  /* Withdrawing ends the placement. The record is kept and dated, because the
+     sessions already taught under it still have to reconcile. */
+  const withdrawFromSchool: Ctx['withdrawFromSchool'] = useCallback(async (id, reason) => {
+    if (!repo) return false;
+    const a = data.assignments.find((x) => x.id === id);
+    if (!a || a.teacherId !== actor.teacherId) return false;
+
+    try {
+      await repo.put('assignments', {
+        ...a, status: 'ended', endDate: today, notes: reason ?? a.notes
+      });
+    } catch {
+      say('That could not be saved. Check your connection and try again.');
+      return false;
+    }
+
+    const school = data.schools.find((s) => s.id === a.schoolId);
+    try {
+      await writeAudit({
+        action: 'assignment.withdrawn', objectType: 'assignment', objectId: id,
+        summary: 'Teacher withdrew from ' + (school?.name ?? a.schoolId)
+                 + (reason ? ' - ' + reason : ''),
+        before: a.status, after: 'ended'
+      });
+    } catch { /* the withdrawal stands without its audit line */ }
+    try {
+      await notify(['school', 'admin'].map((audienceRole) => ({
+        kind: 'assignment-created' as const,
+        title: 'Teacher withdrew from a school',
+        body: (data.teachers.find((t) => t.id === a.teacherId)?.name ?? 'A teacher')
+              + ' has withdrawn from ' + (school?.name ?? 'a school')
+              + (reason ? ' - ' + reason : '.'),
+        audienceRole: audienceRole as Notification['audienceRole'],
+        audienceId: audienceRole === 'school' ? a.schoolId : undefined,
+        href: '/assignments'
+      })));
+    } catch { /* the withdrawal stands without its notifications */ }
+
+    say('You have withdrawn from ' + (school?.name ?? 'the school') + '.');
+    return true;
+  }, [repo, data.assignments, data.schools, data.teachers, actor, today, writeAudit, notify, say]);
+
+  const awaiting: Ctx['awaiting'] = useCallback((r) => awaitingFrom(r), []);
 
   const decideAssignment: Ctx['decideAssignment'] = useCallback(async (id, to, reason) => {
     if (!repo) return;
@@ -564,18 +1101,121 @@ export function DataProvider({ children }: { children: ReactNode }) {
     window.location.reload();
   }, []);
 
+  /* ---------- what is waiting on you ----------
+
+     Every account type has a queue; they are just different queues. Reading
+     them off live records rather than stored notifications means the bell and
+     the module it points at can never disagree, and it works for an account
+     that has never had a notification written for it. */
+
+  const mySessions = useMemo(
+    () => visibleSessions(actor, data.sessions), [actor, data.sessions]);
+
+  const pendingItems = useMemo<PendingItem[]>(() => {
+    const out: PendingItem[] = [];
+    const sessionLine = (s: TeachingSession) =>
+      `${s.subject} · ${s.className} · ${s.schoolName}`;
+
+    /* BR-027 requests, from whichever side is being waited on. Read off the
+       records rather than off stored notifications, so the bell and the queue
+       it points at cannot disagree. */
+    const requests = data.assignments.filter((a) => a.status === 'requested');
+    const schoolName = (id: string) => data.schools.find((s) => s.id === id)?.name ?? id;
+    const teacherName = (id: string) => data.teachers.find((t) => t.id === id)?.name ?? id;
+    const covers = (a: Assignment) =>
+      (a.subjects.join(', ') || 'Any subject') + ' · ' + (a.classes.join(', ') || 'any class');
+
+    if (role === 'teacher') {
+      for (const a of requests.filter((x) => x.teacherId === actor.teacherId)) {
+        out.push({
+          id: a.id, title: 'Request to teach at ' + schoolName(a.schoolId),
+          detail: awaitingFrom(a), href: '/my-schools'
+        });
+      }
+      for (const s of mySessions.filter(isPending)) {
+        out.push({
+          id: s.id, title: 'Waiting on the school', detail: sessionLine(s),
+          href: '/sessions'
+        });
+      }
+      for (const s of mySessions.filter(needsTeacherAction)) {
+        out.push({
+          id: s.id, title: s.status === 'rejected' ? 'Rejected — needs your attention' : 'Correction requested',
+          detail: s.rejectionReason ?? s.correctionReason ?? sessionLine(s),
+          href: '/sessions'
+        });
+      }
+    } else if (role === 'school') {
+      for (const a of requests.filter(
+        (x) => x.schoolId === actor.schoolId && !x.schoolApprovedAt)) {
+        out.push({
+          id: a.id, title: 'Request to teach awaiting your approval',
+          detail: teacherName(a.teacherId) + ' — ' + covers(a), href: '/dashboard'
+        });
+      }
+      for (const s of mySessions.filter(isPending)) {
+        out.push({
+          id: s.id, title: 'Session awaiting your approval',
+          detail: `${sessionLine(s)} — ${s.teacherName}`, href: '/approvals'
+        });
+      }
+    } else {
+      for (const a of requests.filter((x) => !x.adminApprovedAt)) {
+        out.push({
+          id: a.id, title: 'Request to teach awaiting Glampter',
+          detail: teacherName(a.teacherId) + ' → ' + schoolName(a.schoolId), href: '/dashboard'
+        });
+      }
+      for (const u of pendingSignups) {
+        out.push({
+          id: 'reg-' + u.uid, title: `${u.role === 'school' ? 'School' : 'Teacher'} registration`,
+          detail: `${u.displayName || u.email} — awaiting approval`, href: '/dashboard'
+        });
+      }
+      for (const a of adminRoster.filter((x) => x.status === 'pending')) {
+        out.push({
+          id: 'adm-' + a.id, title: 'Administrator registration',
+          detail: `${a.name} — awaiting a super admin`, href: '/admin-manager'
+        });
+      }
+      for (const u of deleteRequests) {
+        out.push({
+          id: 'del-' + u.uid, title: 'Account closure requested',
+          detail: `${u.displayName || u.email} — ${u.deleteRequestReason ?? 'no reason given'}`,
+          href: '/dashboard'
+        });
+      }
+      for (const s of mySessions.filter(isPending)) {
+        out.push({
+          id: s.id, title: 'Session pending approval',
+          detail: `${sessionLine(s)} — ${s.teacherName}`, href: '/approvals'
+        });
+      }
+    }
+    return out;
+  }, [role, actor, data.assignments, data.schools, data.teachers,
+      mySessions, pendingSignups, adminRoster, deleteRequests]);
+
   const value = useMemo<Ctx>(() => ({
     ready, source: repo?.kind ?? 'memory', data, today,
-    mySessions: visibleSessions(actor, data.sessions),
+    mySessions,
     myNotifications: mine,
     unread: mine.filter((n) => !n.read).length,
     saveSession, reviewSession, resubmitSession, cancelSession,
-    myAdmin, isSuperAdmin, adminIssue, setAdminStatus, promoteAdmin,
+    pendingItems, liveUsers, pendingSignups, deleteRequests,
+    saveMyProfile, askToCloseMyAccount, askForApprovalAgain, signAssignment, awaiting,
+    reviseMyAssignment, withdrawFromSchool,
+    decideDeletion, decideRegistration,
+    adminRoster, myAdmin, isSuperAdmin, adminIssue, setAdminStatus, promoteAdmin,
     saveTeacher, saveSchool, setAccountStatus, saveAssignment, decideAssignment,
     saveSubject, saveClass, saveAcademicSession, saveDocument, removeDocument, saveSettings,
     markNotificationsRead, resetDemoData
   }), [ready, repo, data, today, actor, mine, saveSession, reviewSession, resubmitSession,
-    cancelSession, myAdmin, isSuperAdmin, adminIssue, setAdminStatus, promoteAdmin,
+    cancelSession, mySessions, pendingItems, liveUsers, pendingSignups, deleteRequests,
+    saveMyProfile, askToCloseMyAccount, askForApprovalAgain, signAssignment, awaiting,
+    reviseMyAssignment, withdrawFromSchool,
+    decideDeletion, decideRegistration,
+    adminRoster, myAdmin, isSuperAdmin, adminIssue, setAdminStatus, promoteAdmin,
     saveTeacher, saveSchool, setAccountStatus, saveAssignment, decideAssignment,
     saveSubject, saveClass, saveAcademicSession, saveDocument, removeDocument, saveSettings,
     markNotificationsRead, resetDemoData]);
