@@ -117,7 +117,8 @@ function AuthPage() {
       <main className="px-5 py-10 sm:px-10 lg:px-16 lg:py-14 flex flex-col justify-center">
         <div className="w-full max-w-[440px] mx-auto">
           {panel === 'signin' && (
-            <SignIn onPanel={setPanel} />
+            <SignIn onPanel={setPanel}
+              onAdmin={() => { setAdminMode(true); setPanel('register'); }} />
           )}
           {panel === 'register' && (
             <Register onPanel={setPanel} admin={adminMode} onAdmin={setAdminMode} />
@@ -222,19 +223,17 @@ function OrRule() {
   );
 }
 
-/* Shown in the form's error slot when the build carries no Firebase keys, so a
-   visitor reads it. It says what it means for them and nothing about how the
-   thing is built — the setup instructions go to the console in lib/firebase.ts,
-   where the person who can act on them will actually look. */
 function unconfigured() {
   return !firebaseReady
-    ? 'Sign-in is temporarily unavailable. Please try again shortly, or contact Glampter Consults if it continues.'
+    ? 'Firebase is not configured yet. Copy .env.example to .env.local, add the keys, and restart the dev server.'
     : '';
 }
 
 /* ---------- signin ---------- */
 
-function SignIn({ onPanel }: { onPanel: (p: Panel) => void }) {
+function SignIn({ onPanel, onAdmin }: {
+  onPanel: (p: Panel) => void; onAdmin: () => void;
+}) {
   const [email, setEmail] = useState('');
   const [pw, setPw] = useState('');
   const [busy, setBusy] = useState(false);
@@ -288,9 +287,15 @@ function SignIn({ onPanel }: { onPanel: (p: Panel) => void }) {
       </form>
 
       <p className="mt-7 text-sm text-[var(--text-2)]">
-        Just getting started?{' '}
+        New to <BrandWord />?{' '}
         <button className="font-semibold" style={{ color: 'var(--accent)' }} onClick={() => onPanel('register')}>
           Create an account
+        </button>
+      </p>
+      <p className="mt-3 text-sm text-[var(--text-2)]">
+        Administrator?{' '}
+        <button className="font-semibold" style={{ color: 'var(--accent)' }} onClick={onAdmin}>
+          Sign up as an admin
         </button>
       </p>
     </>
@@ -405,7 +410,10 @@ function Register({ onPanel, admin, onAdmin }: {
     <>
       <Head
         eyebrow={admin ? 'Administrator sign-up' : 'Create an account'}
-        title={<>Join <BrandWord /></>} />
+        title={<>Join <BrandWord /></>}
+        sub={admin
+          ? 'Administrator accounts are reviewed by a super admin before they can act.'
+          : 'Tell us who you are — the rest of the form follows from it.'} />
 
       <form onSubmit={submit} className="flex flex-col gap-4" noValidate>
         <FormError msg={err} />
@@ -417,7 +425,8 @@ function Register({ onPanel, admin, onAdmin }: {
             <div className="min-w-0">
               <p className="font-display font-bold text-[15px]">Registering as an administrator</p>
               <p className="text-xs text-[var(--text-2)] mt-1">
-                Administrator privileges are granted after super admin approval.
+                The first administrator on the platform becomes the super admin. Everyone
+                after that waits for a super admin to approve them.
               </p>
               <button type="button" className="text-sm font-semibold mt-2"
                 style={{ color: 'var(--accent)' }}
@@ -428,7 +437,9 @@ function Register({ onPanel, admin, onAdmin }: {
           </div>
         ) : (
           <fieldset>
-            <legend className="field-label">I am registering as</legend>
+            <legend className="field-label">
+              I am registering as<span className="req" aria-hidden="true">*</span>
+            </legend>
             <div className="grid grid-cols-2 gap-2.5">
               {([
                 { v: 'teacher' as Role, icon: GraduationCap, t: 'A teacher', d: 'I teach in schools' },
@@ -548,27 +559,14 @@ function Register({ onPanel, admin, onAdmin }: {
           Sign in
         </button>
       </p>
-      {/* Administrators come in by a different door, so it is set apart rather
-          than queued in with the ordinary links: its own rule, its own card and
-          its own button. Shown for both the teacher and the school paths. */}
       {!admin ? (
-        <div className="mt-8 pt-7 border-t" style={{ borderColor: 'var(--border)' }}>
-          <div className="frame frame-flat p-4">
-            <div className="flex items-center gap-2.5">
-              <ShieldPlus size={17} strokeWidth={1.9} style={{ color: 'var(--accent-ink)' }}
-                className="flex-none" aria-hidden="true" />
-              <p className="font-display font-bold text-[14px]">Administrator?</p>
-            </div>
-            <p className="text-xs text-[var(--text-2)] mt-1.5 max-w-[46ch]">
-              Administrators register on a separate path, and are granted privileges after
-              super admin approval.
-            </p>
-            <button type="button" className="btn btn-ghost btn-sm mt-3"
-              onClick={() => { onAdmin(true); setBad({}); }}>
-              Sign up as an admin
-            </button>
-          </div>
-        </div>
+        <p className="mt-3 text-sm text-[var(--text-2)]">
+          Administrator?{' '}
+          <button className="font-semibold" style={{ color: 'var(--accent)' }}
+            onClick={() => { onAdmin(true); setBad({}); }}>
+            Sign up as an admin
+          </button>
+        </p>
       ) : null}
     </>
   );
